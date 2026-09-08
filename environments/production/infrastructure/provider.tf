@@ -14,3 +14,10 @@ terraform {
     use_azuread_auth     = true                     # auth via your az login, no storage key
   }
 }
+
+provider "azurerm" {
+  features {}
+  subscription_id = var.subscription_id
+}
+
+provider "azuread" {}
