@@ -9,3 +9,16 @@ module "foundation" {
 
   tags = var.tags
 }
+
+module "vnet" {
+  source = "../../../modules/vnet"
+
+  virtual_network_name = var.virtual_network_name
+  resource_group_name  = module.foundation.resource_group_name
+  location             = module.foundation.resource_group_location
+
+  address_space = var.vnet_address_space
+  subnets       = var.subnets
+
+  tags = var.tags
+}
