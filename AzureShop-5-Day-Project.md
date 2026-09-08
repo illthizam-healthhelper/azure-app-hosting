@@ -1,0 +1,4165 @@
+# AzureShop — A 5-Day Production-Style Azure Platform Sprint
+
+**For:** An experienced AWS/Kubernetes/Terraform DevOps engineer learning Azure
+**Constraint:** Azure free credits ($200 / 30 days), environment kept alive **4–5 days only**
+**Primary region:** `southeastasia` (Singapore) · **DR region:** `eastasia` (Hong Kong)
+**Guiding principle:** BUILD → TEST → BREAK → UNDERSTAND → DESTROY → REBUILD
+
+> **Pricing disclaimer.** Every dollar figure in this document is a *cautious estimate* checked against public sources in September 2026. Azure pricing varies by region, SKU, redundancy, and usage, and it changes. Always confirm against the [Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/) and your own Cost Management blade before running an expensive lab. Where a recommendation depends on regional availability, it is flagged.
+
+---
+
+## Table of Contents
+
+| # | Section |
+|---|---|
+| 1 | [Executive Summary](#1-executive-summary) |
+| 2 | [Learning Objectives](#2-learning-objectives) |
+| 3 | [AWS → Azure Mapping](#3-aws--azure-mapping) |
+| 4 | [Target Production Architecture (Mode B)](#4-target-production-architecture-mode-b) |
+| 5 | [Cheap Daily Lab Architecture (Mode A)](#5-cheap-daily-lab-architecture-mode-a) |
+| 6 | [Architecture Diagrams](#6-architecture-diagrams) |
+| 7 | [Cost Strategy & Free Credit Safety Rules](#7-cost-strategy--free-credit-safety-rules) |
+| 8 | [Azure Networking](#8-azure-networking) |
+| 9 | [Identity and Security](#9-identity-and-security) |
+| 10 | [AKS Design](#10-aks-design) |
+| 11 | [Container Platform (ACR)](#11-container-platform-acr) |
+| 12 | [The Application — What to Host](#12-the-application--what-to-host) |
+| 13 | [Terraform Architecture](#13-terraform-architecture) |
+| 14 | [GitHub Actions + OIDC](#14-github-actions--oidc) |
+| 15 | [Kubernetes Manifests](#15-kubernetes-manifests) |
+| 16 | [Observability](#16-observability) |
+| 17 | [Security Hardening](#17-security-hardening) |
+| 18 | [Disaster Recovery](#18-disaster-recovery) |
+| 19 | [Failure Engineering Lab](#19-failure-engineering-lab) |
+| 20 | [The 5-Day Schedule](#20-the-5-day-schedule) |
+| 21 | [Day 0 & Day 1 — Exact Steps](#21-day-0--day-1--exact-steps) |
+| 22 | [Troubleshooting](#22-troubleshooting) |
+| 23 | [Cost Monitoring Commands](#23-cost-monitoring-commands) |
+| 24 | [Teardown Strategy](#24-teardown-strategy) |
+| 25 | [Interview Questions](#25-interview-questions) |
+| 26 | [Portfolio README Template](#26-portfolio-readme-template) |
+| 27 | [Definition of Done](#27-definition-of-done) |
+
+---
+
+## 1. Executive Summary
+
+### What we are building
+
+**AzureShop** is a containerised e-commerce platform on Azure: a Vue frontend, REST APIs, a queue-driven background worker, a SQL database, a Redis cache, and Blob object storage — running on private-networked AKS, fronted by Front Door and a WAF, secured with Entra ID Workload Identity and Key Vault, deployed by Terraform and GitHub Actions with OIDC, observed by Managed Prometheus / Grafana / OpenTelemetry, and failed over across two Azure regions.
+
+### Why we are building it this way
+
+You already know the *concepts*. What you don't know is **Azure's specific mechanics**, and those mechanics are where interviews and production incidents live: Private DNS zone linking, the Entra ID / Azure RBAC split, node pool taints in AKS, Front Door's Private Link tier gating, and the fact that Azure subnets are regional rather than zonal.
+
+So this document is deliberately **not** a "leave it running for a month" architecture. It is a **5-day sprint** built around create/verify/destroy cycles, because:
+
+1. You have finite credits.
+2. Building the same platform three times teaches more than watching it idle for thirty days.
+3. "I can rebuild this entire platform from an empty subscription in 40 minutes" is a stronger interview claim than "I had it running once."
+
+### What makes it production-like
+
+- Private data plane: no database, cache, or registry reachable from the public internet.
+- Zero static cloud credentials anywhere — OIDC federation for CI, Workload Identity for pods.
+- Infrastructure fully in Terraform with remote state and locking.
+- Real edge: global anycast, WAF managed rules, health-probe-driven regional failover.
+- Measured RTO/RPO from an actual induced regional outage, not a diagram.
+
+### What you should be able to explain in a Senior DevOps interview afterwards
+
+- Why an Azure subnet spanning three availability zones is *not* the same as an AWS subnet, and how that changes your CIDR plan.
+- Why a Private Endpoint without a linked Private DNS zone silently resolves to a public IP, and how to detect it.
+- The difference between Entra ID, Azure RBAC, and data-plane RBAC (and why "Owner" doesn't let you read a Key Vault secret).
+- How Workload Identity's federated credential subject maps to `system:serviceaccount:<ns>:<sa>`, and why the pod label matters as well as the SA annotation.
+- Why Application Gateway WAF v2 costs ~$0.44/hour before a single request, and when Front Door Premium's bundled WAF is cheaper.
+- What actually happens to in-flight sessions when Front Door's health probe marks Region 1 down.
+- What ingress-nginx's retirement means for AKS, and what Gateway API changes.
+- Your own measured RTO and RPO numbers, and why the RPO is what it is.
+
+### Honest scoping note
+
+This is an **aggressive** 5 days. At 3–4 hours/day you will complete the CORE track. At 6+ hours/day you will complete CORE plus most STRETCH items. Every day below is marked `[CORE]` or `[STRETCH]`. **Drop STRETCH items without guilt** — a working, well-understood Days 1–3 beats a half-broken Day 5.
+
+---
+
+## 2. Learning Objectives
+
+| Skill | Azure Service | Hands-on Exercise | Expected Knowledge |
+|---|---|---|---|
+| Subscription & governance | Management groups, RGs, Tags, Budgets | Create RG taxonomy, apply tag policy, set budget alert at $50/$100/$150 | Why RGs are a *lifecycle* boundary, not an AWS-account analogue; RG delete = mass delete |
+| VNet design | VNet, Subnet, NSG, UDR | Build 4-subnet /16 with NSGs and a NAT Gateway | Subnets are **regional not zonal**; NSGs have priority-ordered allow *and* deny; default outbound access is retiring |
+| Private connectivity | Private Endpoint, Private DNS Zone | Put SQL, Redis, Storage, Key Vault, ACR behind private endpoints | A PE without a linked `privatelink.*` zone resolves publicly — the single most common Azure networking bug |
+| Identity | Microsoft Entra ID, Azure RBAC | Create user-assigned MI, assign scoped roles | Entra ID = authentication, Azure RBAC = ARM authorisation, data-plane RBAC = a third layer |
+| Workload identity | AKS OIDC issuer, Federated credentials | Pod reads a Key Vault secret with no secret mounted | Federated subject format; pod needs the label *and* the SA needs the annotation |
+| CI/CD identity | Entra App Registration, Federated credentials | GitHub Actions deploys with zero stored secrets | Why `AZURE_CREDENTIALS` JSON blobs are an anti-pattern |
+| Kubernetes on Azure | AKS | Build cluster with CNI Overlay + Cilium, system/user pools, autoscaler | System vs user node pool is enforced; VMSS underneath; control plane Free tier has no SLA |
+| Ingress | App routing add-on, Gateway API, App Gateway | Expose the app 3 ways; compare | ingress-nginx retired Mar 2026; AKS NGINX add-on supported to Nov 2026; Gateway API is the destination |
+| Containers | ACR | Build, tag immutably, scan, push, pull with MI | ACR geo-replication is one registry with replicas, not N registries |
+| Secrets | Key Vault, CSI Secrets Store | Mount a secret via CSI driver + Workload Identity | Soft-delete/purge protection reserves the vault name — this will break your `terraform destroy && apply` |
+| IaC | Terraform azurerm | Two-mode deployment (`lab` / `production`) | Blob lease = native state locking; no DynamoDB equivalent needed |
+| Observability | Azure Monitor, Log Analytics, Managed Prometheus, Managed Grafana, App Insights | Dashboards + alerts + distributed traces | KQL; metrics are cheap, logs are per-GB; daily cap is your friend |
+| Edge & WAF | Front Door, Application Gateway WAF v2 | Route traffic globally, block a SQLi probe | WAF is a *SKU* of App Gateway, and *bundled* in Front Door Premium |
+| Scaling & HA | HPA, Cluster Autoscaler, PDB, zones, topology spread | Load-test into a scale-out event | AZ-aware scheduling on regional subnets |
+| Disaster recovery | Front Door origin groups, geo-restore | Kill Region 1, measure failover | Health probe interval defines detection time; free-tier SQL has no failover groups |
+| Cost | Cost Management, Budgets | Track spend hourly, destroy on schedule | Which meters bill on *existence* vs *usage* |
+
+---
+
+## 3. AWS → Azure Mapping
+
+The mapping is the easy half. The **architectural difference** column is the half that matters.
+
+### Networking
+
+| AWS | Azure | The difference that will actually catch you out |
+|---|---|---|
+| VPC | Virtual Network (VNet) | Broadly equivalent. But there is no Internet Gateway object — internet routing is a *system route* you override with a UDR. |
+| Subnet (bound to one AZ) | Subnet (**regional — spans all zones**) | **Biggest single mental model change.** You do *not* create `subnet-a`, `subnet-b`, `subnet-c` for three AZs. One subnet covers the region; zone placement is a property of the *resource*, not the subnet. Your CIDR plan gets much simpler and your IP maths changes. |
+| Security Group | Network Security Group (NSG) | Stateful like an SG, but has explicit **Deny** rules and **priority numbers** (100–4096), and attaches to a *subnet* or a NIC. Behaves like an SG and a NACL merged. Default rules already permit intra-VNet traffic. |
+| NACL | (no separate object) | Folded into NSG. |
+| Route table | Route table / UDR | You override *system routes*. `0.0.0.0/0 → Internet` exists by default. |
+| Internet Gateway | (implicit) | No object to create. |
+| NAT Gateway (per-AZ) | NAT Gateway (attach to subnet) | Similar pricing shape (~$0.045/hr + ~$0.045/GB). **Critical current change:** Azure is retiring *default outbound access*, so a VM/node with no explicit egress path will simply have no internet. You must attach a NAT Gateway or LB outbound rule. |
+| VPC Endpoint (Interface) | **Private Endpoint** | Same idea, but Azure requires you to also link a **Private DNS Zone** (`privatelink.database.windows.net`, etc.) to the VNet. AWS does this for you with private DNS on the endpoint. Forget this and everything "works" — against the public IP. |
+| VPC Endpoint (Gateway, S3/DDB) | Service Endpoint | Service Endpoints keep traffic on the Azure backbone but the resource keeps a public IP. Private Endpoint is the stronger control. |
+| Route 53 (public) | Azure DNS | Equivalent. |
+| Route 53 private hosted zone | Private DNS Zone | Must be explicitly **linked** to each VNet with a virtual network link. Not automatic. |
+| Transit Gateway | VNet Peering / Virtual WAN | Peering is non-transitive by default. |
+
+### Compute & Containers
+
+| AWS | Azure | Difference |
+|---|---|---|
+| EC2 | Virtual Machine | Sizes are `Standard_D2ads_v6` style. B-series = burstable ≈ t-series. |
+| Auto Scaling Group | Virtual Machine Scale Set (VMSS) | AKS node pools *are* VMSS. |
+| EKS | **AKS** | Control plane has a genuinely **free tier** ($0/hr, no SLA, recommended <10 nodes) vs Standard at $0.10/cluster/hr. EKS charges $0.10/hr regardless. AKS also enforces a **system node pool** / user node pool distinction that EKS has no concept of. |
+| EKS managed node group | AKS node pool | System pool runs CoreDNS/metrics-server and cannot be Spot. |
+| Fargate | AKS Virtual Nodes / Azure Container Apps | ACA is closer to App Runner + Fargate. |
+| ECR | **ACR** | Name is globally unique (`myreg.azurecr.io`). Geo-replication is **one registry object with replicas**, so the *same* login server serves all regions — unlike ECR where you manage per-region registries and replication rules. Premium SKU only. |
+| ECR image scanning | Defender for Containers / Trivy | Native scanning is a paid Defender plan; Trivy in CI is free. |
+
+### Identity
+
+| AWS | Azure | Difference |
+|---|---|---|
+| IAM (one policy engine) | **Microsoft Entra ID** (authN) **+ Azure RBAC** (authZ) **+ data-plane RBAC** | Three layers, not one. Being `Owner` on a Key Vault does **not** let you read a secret — you need `Key Vault Secrets User` on the data plane. This trips up every AWS engineer on day one. |
+| IAM Role | Role assignment (role definition + scope + principal) | Roles are *assigned* at a scope (MG / subscription / RG / resource), inherited downward. |
+| IAM instance profile | **Managed Identity** (system- or user-assigned) | A user-assigned MI is a **standalone ARM resource with its own object ID** that you attach to many resources. Closer to a role, but it's an identity object, not a policy attachment. |
+| IRSA (IAM Roles for Service Accounts) | **Workload Identity** | Same OIDC federation mechanism. Differences: you annotate the ServiceAccount with `azure.workload.identity/client-id` **and** you must label the *Pod* `azure.workload.identity/use: "true"`. Missing the pod label is the #1 failure. |
+| OIDC trust for GitHub Actions | Federated credential on an App Registration | Same idea; subject is `repo:org/repo:ref:refs/heads/main` or `repo:org/repo:environment:prod`. |
+| Secrets Manager / SSM Parameter Store | **Key Vault** | Vault has its own DNS endpoint. **Soft-delete + purge protection are on by default** and *reserve the name* after deletion — your `terraform destroy` then `apply` will fail with "vault name already in use". Plan for it. |
+| KMS | Key Vault keys / Managed HSM | Same vault covers keys, secrets, certs. |
+
+### Data
+
+| AWS | Azure | Difference |
+|---|---|---|
+| RDS | **Azure SQL Database** | You don't size a *server* — the "server" is a logical endpoint with no cost. You size the **database** (vCore/DTU). Serverless tier **auto-pauses** when idle, which has no direct RDS equivalent (Aurora Serverless v2 is closest). |
+| RDS Multi-AZ | Zone-redundant configuration | A checkbox on higher tiers, not a separate standby you manage. |
+| RDS Read Replica / Global DB | Active geo-replication / **Failover Groups** | Failover Group ≈ Aurora Global Database with a managed listener endpoint. **Not available on the free offer.** |
+| ElastiCache | **Azure Cache for Redis** | VNet *injection* is Premium-tier only; Basic/Standard use **Private Endpoint** instead. Provisioning takes 15–25 minutes — start it early. |
+| S3 | **Blob Storage** | Three levels (Account → Container → Blob) vs S3's two. Account name is globally unique DNS. Redundancy (LRS/ZRS/GRS) is set at the *account*, not the bucket. |
+| S3 bucket policy | RBAC data roles + SAS | `Storage Blob Data Contributor` is a *control-plane role that grants data-plane access* — a genuinely confusing hybrid. |
+
+### Edge & Delivery
+
+| AWS | Azure | Difference |
+|---|---|---|
+| ALB | **Application Gateway v2** | Priced per **gateway-hour + capacity units**, not LCUs. WAF is not a separate attached service — it's a **SKU of the gateway** (`WAF_v2`). It needs a **dedicated subnet**. |
+| NLB | Azure Load Balancer (Standard) | Needs explicit outbound rules for egress. |
+| CloudFront | **Azure Front Door** | Front Door is CDN + global L7 load balancer + WAF + health-probe failover in one product. CloudFront needs Route 53 health checks + failover records to match it. **Private Link to origin is Premium-tier only.** |
+| AWS WAF | Front Door WAF or App Gateway WAF | Two different products with two pricing models. Front Door Premium *bundles* managed rules in its base fee; App Gateway bills WAF by the hour. |
+| Route 53 failover routing | Front Door origin groups (priority/weight) | Failover is a *property of the origin group*, not DNS records. Detection is driven by health probe interval, not DNS TTL — this makes Azure failover generally faster. |
+
+### Operations
+
+| AWS | Azure | Difference |
+|---|---|---|
+| CloudWatch Logs | **Log Analytics Workspace** | You must create a workspace. Query language is **KQL**, not Insights syntax. Billed per GB ingested. |
+| CloudWatch Metrics | Azure Monitor Metrics | Platform metrics are free; log-based metrics are not. |
+| CloudWatch Alarms | Alert rules + **Action Groups** | Action Group ≈ SNS topic (email/webhook/function targets). |
+| X-Ray | Application Insights | Part of Azure Monitor; workspace-based. OpenTelemetry is the supported ingestion path. |
+| AMP (Managed Prometheus) | **Azure Monitor workspace** + managed Prometheus | Note the naming collision: "Azure Monitor workspace" (metrics) ≠ "Log Analytics workspace" (logs). Two different resources. |
+| Amazon Managed Grafana | **Azure Managed Grafana** | Priced per instance-hour + active user, not per-user-role. First instance in a subscription is **free for 30 days**. |
+| SCP / Config Rules | **Azure Policy** | Azure Policy can **Deny**, **Audit**, *and* **DeployIfNotExists** (auto-remediate) — more powerful than SCPs. |
+| GuardDuty + Security Hub | **Defender for Cloud** | Foundational CSPM is free; per-resource-type plans are paid. |
+| S3 + DynamoDB Terraform backend | `azurerm` backend | Blob **lease** provides native state locking. No lock table to create. Nicer than S3+DDB. |
+
+---
+
+## 4. Target Production Architecture (Mode B)
+
+This is what you *describe* in interviews and what you stand up temporarily on Days 4–5.
+
+**Public surface (exactly two things):**
+1. Front Door's anycast edge (`azureshop-xxxx.z01.azurefd.net`)
+2. Nothing else.
+
+**Everything else is private:** AKS nodes have no public IPs, the API server is IP-restricted or private, and SQL / Redis / Storage / Key Vault / ACR are reachable only through Private Endpoints inside the VNet.
+
+### Request path
+
+```
+Browser
+  → Front Door edge (TLS terminate, cache, anycast)
+  → WAF policy (OWASP managed ruleset, rate limiting, bot rules)
+  → Origin group (priority-routed: SEA=1, EAS=2)
+  → Application Gateway WAF_v2 public frontend, locked to the
+    AzureFrontDoor.Backend service tag + X-Azure-FDID header check
+  → AGIC-managed backend pool → AKS pod IPs (CNI Overlay)
+  → store-front pod
+  → order-service / product-service (ClusterIP)
+  → Private Endpoint → Azure SQL      (10.20.3.x)
+  → Private Endpoint → Redis          (10.20.3.x)
+  → Private Endpoint → Blob Storage   (10.20.3.x)
+  → makeline-service worker consumes queue, writes SQL
+```
+
+Outbound (image pulls from public registries, OS updates, OTel export) leaves through the **NAT Gateway** with a single static public IP — which is also your allowlist anchor for any third-party API.
+
+### Regional vs global resources
+
+| Resource | Scope | Duplicated in DR? | Notes |
+|---|---|---|---|
+| Front Door profile + WAF policy | **Global** | No — one profile, two origins | Origin group holds both regions |
+| Entra ID tenant, App Registrations, federated creds | **Global** | No | Identity is tenant-wide |
+| Azure DNS public zone | **Global** | No | |
+| Terraform state storage account | Regional but **shared** | No | Keep it in primary; it's tiny and losing it is worse than a cross-region dependency |
+| ACR | Regional resource, **Premium = geo-replicated** | No (replicated, not duplicated) | Same login server everywhere |
+| Log Analytics workspace | Regional | **Shared** — one workspace, both regions ship to it | Cross-region ingest costs a little; a single pane of glass is worth it for a lab |
+| VNet, subnets, NSGs, NAT GW | Regional | **Yes** | Non-overlapping CIDRs (10.20/16, 10.21/16) |
+| AKS cluster + node pools | Regional | **Yes** | Same Terraform module, different `var.location` |
+| Application Gateway + WAF | Regional | **Yes** | The expensive duplicate |
+| Azure SQL | Regional | **Yes** — via geo-replication or geo-restore | See §18 for the free-tier caveat |
+| Redis | Regional | **Yes** (empty cache in DR — a cache is not a source of truth) | Cold cache after failover is *expected*, not a bug |
+| Storage account | Regional, **RA-GRS** | Replicated | Secondary endpoint is read-only until failover |
+| Key Vault | Regional | **Yes** | Same secret names, different vault; or one vault + cross-region PE |
+| Managed Grafana / Azure Monitor workspace | Regional | **Shared** | |
+
+---
+
+## 5. Cheap Daily Lab Architecture (Mode A)
+
+Mode A gives you ~85% of the learning at ~12% of the cost. It is what runs on Days 1–3.
+
+**What changes vs Mode B:**
+
+| Mode B (production) | Mode A (lab) | Why it's an acceptable substitute |
+|---|---|---|
+| Front Door Premium + Private Link origin | **No Front Door on Days 1–3**; Front Door **Standard** on Day 4 | Standard gives you origin groups, health probes, priority routing and custom WAF rules — every DR mechanic. Only Private Link origin and managed rulesets are Premium-gated. |
+| App Gateway WAF_v2 (~$10.60/day) | **AKS app routing add-on** (managed NGINX) on an LB | Same L7 routing concepts, ~$0.60/day. Stand up App Gateway for one Day-4 session only. |
+| Private AKS cluster | Public API server **restricted to your home IP** | You practise the real access control; you skip the jumpbox/Bastion cost (~$4.50/day). Build one private cluster on Day 4 using `az aks command invoke` to prove you can. |
+| 3-node zone-spread user pool | 1 system node + autoscaling user pool (1→3) | Scale up only for the HPA/topology-spread lab, then back down. |
+| Zone-redundant SQL, Business Critical | **Azure SQL free offer** (serverless GP, auto-pause) | $0. 100,000 vCore-seconds + 32 GB per database per month, up to 10 databases per subscription, for the life of the subscription. |
+| Redis Premium (VNet injected) | **Basic C0** + Private Endpoint | ~$0.53/day. You still practise private DNS resolution. |
+| ACR Premium (geo-rep + private link) | **ACR Basic** | ~$0.17/day. Premium for one Day-5 session. |
+| Container Insights full ingestion | **Cost-optimised preset + 1 GB daily cap** | Prevents the classic "my logs bill exceeded my compute bill" outcome. |
+| Defender for Cloud paid plans | **Free foundational CSPM only** | You get the recommendations and secure score; you skip the per-resource meters. |
+
+**Always-on during the 5 days (destroy at the end):** VNet + NSGs + NAT Gateway, Key Vault, Storage, ACR Basic, Log Analytics, AKS (Free tier control plane) with a minimal node pool, Azure SQL (free offer), Redis Basic C0.
+
+**Temporary (create → practise → verify → destroy in one session):** Application Gateway + WAF, Front Door, Managed Grafana, second region, Bastion, ACR Premium, extra nodes.
+
+---
+
+## 6. Architecture Diagrams
+
+### 6.1 Mode A — Cheap daily lab (Days 1–3)
+
+```mermaid
+flowchart TB
+    U["Your laptop / browser"]
+
+    subgraph AZ["Azure — southeastasia"]
+      subgraph RG["rg-azshop-lab-sea"]
+        LB["Standard Load Balancer<br/>(public IP)<br/>~$0.13/day"]
+
+        subgraph VNET["vnet-azshop-lab-sea — 10.20.0.0/16"]
+          subgraph SN1["snet-aks 10.20.0.0/22"]
+            direction TB
+            NGX["app routing add-on<br/>managed NGINX"]
+            FE["store-front"]
+            API["order-service<br/>product-service"]
+            WRK["makeline-service<br/>(worker)"]
+            APP["azureshop-api<br/>(custom, Workload Identity)"]
+          end
+          subgraph SN2["snet-pe 10.20.5.0/24"]
+            PE1(["PE → SQL 10.20.5.x"])
+            PE2(["PE → Redis"])
+            PE3(["PE → Blob"])
+            PE4(["PE → Key Vault"])
+            PE5(["PE → ACR"])
+          end
+          NAT["NAT Gateway<br/>~$1.08/day"]
+        end
+
+        SQL[("Azure SQL<br/>serverless free offer<br/>$0")]
+        RDS[("Redis Basic C0<br/>~$0.53/day")]
+        BLOB[("Blob Storage<br/>~$0.02/day")]
+        KV["Key Vault<br/>~$0"]
+        ACR["ACR Basic<br/>~$0.17/day"]
+        LAW["Log Analytics<br/>1 GB daily cap"]
+      end
+    end
+
+    U -->|"HTTP"| LB --> NGX
+    NGX --> FE
+    NGX --> API
+    NGX --> APP
+    API --> WRK
+    APP --> PE1 --> SQL
+    APP --> PE2 --> RDS
+    APP --> PE3 --> BLOB
+    APP --> PE4 --> KV
+    SN1 -.->|"image pull"| PE5 --> ACR
+    SN1 -.->|"egress"| NAT
+    SN1 -.->|"logs/metrics"| LAW
+```
+
+### 6.2 Mode B — Production simulation, multi-region (Days 4–5)
+
+```mermaid
+flowchart TB
+    U["Internet users"]
+    FD["Azure Front Door<br/>GLOBAL — anycast edge"]
+    WAF["WAF policy<br/>OWASP managed rules"]
+    OG{"Origin group<br/>priority routing<br/>health probe /healthz"}
+
+    subgraph R1["PRIMARY — southeastasia (priority 1)"]
+      AGW1["App Gateway WAF_v2<br/>snet-appgw 10.20.2.0/24"]
+      subgraph K1["AKS — vnet 10.20.0.0/16"]
+        SYS1["system pool<br/>1x B2ms"]
+        USR1["user pool<br/>1-3x B2ms, zones 1,2,3"]
+      end
+      SQL1[("Azure SQL<br/>PRIMARY (writable)")]
+      RDS1[("Redis")]
+    end
+
+    subgraph R2["SECONDARY — eastasia (priority 2)"]
+      AGW2["App Gateway WAF_v2"]
+      subgraph K2["AKS — vnet 10.21.0.0/16"]
+        SYS2["system pool"]
+        USR2["user pool"]
+      end
+      SQL2[("Azure SQL<br/>geo-secondary (read-only)<br/>or geo-restore target")]
+      RDS2[("Redis — cold cache")]
+    end
+
+    subgraph G["GLOBAL / SHARED"]
+      ACR["ACR Premium<br/>geo-replicated<br/>one login server"]
+      ENTRA["Entra ID<br/>MIs + federated creds"]
+      LAW["Log Analytics<br/>+ Azure Monitor workspace<br/>+ Managed Grafana"]
+      TFS["Terraform state<br/>blob + lease lock"]
+    end
+
+    U --> FD --> WAF --> OG
+    OG -->|"priority 1 — healthy"| AGW1 --> K1
+    OG -.->|"priority 2 — only if R1 unhealthy"| AGW2 --> K2
+    K1 --> SQL1
+    K1 --> RDS1
+    K2 --> SQL2
+    K2 --> RDS2
+    SQL1 ==>|"geo-replication / geo-restore"| SQL2
+    K1 -.-> ACR
+    K2 -.-> ACR
+    K1 -.-> LAW
+    K2 -.-> LAW
+    ENTRA -.-> K1
+    ENTRA -.-> K2
+```
+
+### 6.3 Authentication flows — zero static credentials
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GH as GitHub Actions runner
+    participant GHO as GitHub OIDC issuer
+    participant EID as Microsoft Entra ID
+    participant ARM as Azure Resource Manager
+
+    Note over GH,ARM: CI/CD — no client secret exists anywhere
+    GH->>GHO: request OIDC token (aud=api://AzureADTokenExchange)
+    GHO-->>GH: signed JWT<br/>sub=repo:you/azureshop:environment:prod
+    GH->>EID: token exchange (client_id, tenant_id, JWT)
+    EID->>EID: match federated credential on App Registration
+    EID-->>GH: Azure AD access token (~1h)
+    GH->>ARM: terraform apply / az aks / docker push
+    ARM-->>GH: authorised by Azure RBAC role assignment
+```
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant POD as Pod (azureshop-api)
+    participant SA as ServiceAccount projected token
+    participant OIDC as AKS OIDC issuer
+    participant EID as Microsoft Entra ID
+    participant KV as Key Vault (data plane)
+
+    Note over POD,KV: Workload Identity — no secret mounted, no MI credential on node
+    POD->>SA: read /var/run/secrets/azure/tokens/azure-identity-token
+    Note right of SA: injected because pod has label<br/>azure.workload.identity/use "true"
+    SA-->>POD: projected SA JWT (issuer = AKS OIDC URL)
+    POD->>EID: exchange JWT for AAD token<br/>(client_id from SA annotation)
+    EID->>OIDC: validate signature against cluster OIDC issuer
+    EID->>EID: match federated credential<br/>sub=system:serviceaccount:azureshop:azureshop-sa
+    EID-->>POD: AAD access token for vault.azure.net
+    POD->>KV: GET /secrets/sql-connection-string
+    KV-->>POD: secret (authorised by "Key Vault Secrets User" role)
+```
+
+### 6.4 Network / CIDR layout
+
+```mermaid
+flowchart LR
+    subgraph P["PRIMARY — southeastasia — 10.20.0.0/16"]
+      A["snet-aks<br/>10.20.0.0/22<br/>1019 usable node IPs"]
+      B["snet-appgw<br/>10.20.4.0/24<br/>DEDICATED — App Gateway only"]
+      C["snet-pe<br/>10.20.5.0/24<br/>private endpoint NICs"]
+      D["AzureBastionSubnet<br/>10.20.6.0/26<br/>exact name required"]
+      E["snet-apiserver<br/>10.20.7.0/28<br/>API Server VNet Integration<br/>must be delegated"]
+    end
+    subgraph POD["Pod CIDR — OVERLAY, not from VNet"]
+      F["192.168.0.0/16<br/>routed by Azure CNI Overlay<br/>never consumes VNet IPs"]
+    end
+    subgraph S["SECONDARY — eastasia — 10.21.0.0/16"]
+      G["mirror of the above,<br/>non-overlapping"]
+    end
+    A -.->|"pods get overlay IPs"| F
+```
+
+---
+
+## 7. Cost Strategy & Free Credit Safety Rules
+
+### 7.1 The cost-first resource table
+
+Cost risk ratings assume `southeastasia`, smallest practical SKU, September 2026 public pricing.
+
+| Resource | Purpose | Typical cost risk | Lab recommendation | Always-on? | Destroy after lab? |
+|---|---|---|---|---|---|
+| **Application Gateway WAF_v2** | L7 + WAF | 🔴 **VERY HIGH** — ~$0.443/gateway-hour **plus** ~$0.0144/capacity-unit-hour, and it bills from creation with zero traffic. ~$10.60/day. | Create for ONE 3-hour session on Day 4 (~$1.60), then destroy | ❌ | ✅ **YES — immediately** |
+| **Azure Front Door Premium** | Global LB + managed WAF + Private Link origin | 🔴 **HIGH** — $330/profile/month base (~$0.45/hr) | Use **Standard** ($35/mo, ~$0.048/hr) for the DR lab. Premium for one short session only | ❌ | ✅ |
+| **Azure Firewall** | Egress filtering | 🔴 **EXTREME** — Standard ~$1.25/hr + $0.016/GB, ~$900/month floor | **DO NOT DEPLOY.** Use NSGs + NAT Gateway | ❌ | n/a |
+| **Azure Bastion** | Private VM access | 🟠 HIGH — ~$0.19/hr Basic | Skip. Use `az aks command invoke` (free) | ❌ | ✅ |
+| **AKS nodes (VMSS)** | Compute | 🟠 MEDIUM — B2ms ≈ $0.083/hr each | 1 system node baseline; scale user pool up only during scaling labs | ⚠️ scale to 0/1 overnight | ✅ at end |
+| **AKS control plane** | K8s API | 🟢 **FREE** on Free tier ($0/hr, no SLA, recommended <10 nodes) | Free tier. Standard is $0.10/cluster/hr and buys an SLA you can't use | ✅ | ✅ at end |
+| **NAT Gateway** | Explicit egress | 🟡 LOW-MED — ~$0.045/hr + ~$0.045/GB, **bills from creation even unattached** | Keep (required — default outbound access is being retired) | ✅ | ✅ |
+| **Public IP (Standard)** | LB/NAT frontend | 🟡 LOW — ~$0.005/hr each, but **orphaned IPs bill forever** | Audit daily (see §23) | ✅ | ✅ |
+| **Standard Load Balancer** | AKS service LB | 🟡 LOW — ~$0.025/hr + rules | One only | ✅ | ✅ |
+| **Azure SQL Database** | Relational store | 🟢 **FREE** — free offer gives 10 serverless General Purpose DBs, each with 100,000 vCore-seconds, 32 GB data + 32 GB backup per month, for the life of the subscription | Use it. Set "auto-pause when free limit reached", **not** "continue for charges" | ✅ | Optional (it's free) |
+| **PostgreSQL Flexible Server** | Alternative RDBMS | 🟡 LOW-MED — B1ms is in the 12-month free services list; outside that ~$0.017/hr + storage | Only if you specifically want PG. SQL free offer is cheaper | ❌ | ✅ |
+| **Azure Cache for Redis** | Cache | 🟡 LOW — Basic C0 ~$16/mo (~$0.022/hr). Standard C0 ~$40/mo. Premium (VNet injection) ~$405/mo | **Basic C0 only.** Takes 15–25 min to provision — start it first | ✅ | ✅ |
+| **ACR** | Registry | 🟢 LOW — Basic ~$5/mo (~$0.007/hr). Premium ~$50/mo | Basic. Premium only for the geo-replication demo | ✅ | ✅ |
+| **Key Vault** | Secrets | 🟢 NEGLIGIBLE — per-operation | Standard tier | ✅ | ⚠️ purge required (see §24) |
+| **Blob Storage** | Objects | 🟢 NEGLIGIBLE at lab volume | LRS Hot, StorageV2 | ✅ | ✅ |
+| **Private Endpoints** | Private connectivity | 🟡 LOW — ~$0.01/hr each + per-GB. 5 endpoints ≈ $1.20/day | Keep 5; don't sprawl | ✅ | ✅ |
+| **Log Analytics** | Logs | 🟠 **MEDIUM–HIGH and sneaky** — per-GB ingestion. Container Insights on a chatty cluster can produce GBs/day | **Set a 1 GB daily cap.** Use the cost-optimised Container Insights preset | ✅ | ✅ |
+| **Azure Monitor workspace + Managed Prometheus** | Metrics | 🟡 LOW-MED — per-sample ingestion | Enable Day 3 only | ⚠️ | ✅ |
+| **Azure Managed Grafana** | Dashboards | 🟡 LOW — ~$25/mo instance + ~$6/active user; **first instance in a subscription is free for 30 days** | Create it **once, on Day 3**, deliberately. Don't waste the free window | ⚠️ | ✅ |
+| **Defender for Cloud** | CSPM/CWPP | 🟡 Foundational CSPM free; per-resource plans paid | Free tier only. **Do not enable Defender for Containers/SQL** | ✅ (free tier) | n/a |
+| **VNet / Subnets / NSGs / Private DNS zones / Route tables** | Networking | 🟢 **FREE** | Use freely | ✅ | ✅ |
+| **Managed disks** | Node OS disks | 🟡 LOW — but **orphaned disks after node deletion bill forever** | Audit daily | ✅ | ✅ |
+
+### 7.2 Meters that bill on *existence*, not usage — the silent killers
+
+These charge whether or not a single byte flows. Audit these first, always:
+
+1. **Application Gateway** — bills the instant it exists, even with no backend and no traffic.
+2. **NAT Gateway** — bills even if not associated with any subnet.
+3. **Public IP addresses (Standard SKU)** — bill even when unassociated. Deleting a VM/LB often leaves these behind.
+4. **Managed disks** — orphaned after the owning VM is deleted.
+5. **Azure Cache for Redis** — bills 24/7 regardless of connections.
+6. **Front Door profile** — base fee is hourly-prorated but constant.
+7. **Load Balancer rules** — persist after the Kubernetes Service is deleted if the LB itself remains.
+8. **Log Analytics retention beyond the free 31 days** — silently accrues per GB-month.
+
+### 7.3 Azure Free Credit Safety Rules
+
+**Rule 1 — Know your balance before every session.**
+```bash
+# Portal is authoritative for credit balance:
+#   Portal → Cost Management + Billing → Credits + commitments
+# CLI approximation of spend:
+az consumption usage list \
+  --start-date $(date -u -d '5 days ago' +%Y-%m-%d) \
+  --end-date   $(date -u +%Y-%m-%d) \
+  --query "[].{name:instanceName, cost:pretaxCost, currency:currency}" -o table
+```
+
+**Rule 2 — Set budgets before you create anything expensive.** See §21 Day 1 Step 6.
+
+**Rule 3 — Never leave a session without running the audit script.** See §23.
+
+**Rule 4 — Never create App Gateway, Front Door Premium, Bastion, or a second region without a destroy timer.** Set a literal phone alarm for +3 hours.
+
+**Rule 5 — Free trial subscriptions have crippling quotas.** Default regional vCPU quota is often 4, Spot quota is often 0, and you frequently **cannot request an increase until you upgrade to pay-as-you-go**. Check before you write Terraform:
+```bash
+az vm list-usage --location southeastasia -o table | grep -iE "Total Regional|BS Series|DSv3|Standard D"
+```
+If `Total Regional vCPUs` limit is 4, two `Standard_B2ms` nodes (2 vCPU each) is your entire budget.
+
+**Rule 6 — Understand the upgrade trade-off.** Upgrading to pay-as-you-go unlocks quota, and remaining free credit stays usable until the original 30-day expiry. But it **removes the spending-limit safety net** that would otherwise halt your resources at $200. If you upgrade, set budget alerts the same hour.
+
+**Rule 7 — Tag everything with a lifecycle tag** so the audit script can find strays:
+```
+Project=AzureShop  Owner=<you>  Lifecycle=ephemeral  DestroyBy=<YYYY-MM-DD>
+```
+
+**Rule 8 — Terraform destroy is not enough.** AKS creates a *node resource group* (`MC_*`) and Kubernetes `Service type=LoadBalancer` creates Azure resources outside Terraform state. Delete Kubernetes LoadBalancer services *before* `terraform destroy`. See §24.
+
+---
+
+## 8. Azure Networking
+
+### 8.1 CIDR plan
+
+Deliberately using `10.20.0.0/16` and `10.21.0.0/16` so this never collides with a typical AWS VPC (`10.0.x`) or home LAN (`192.168.x`).
+
+**Primary — `southeastasia` — `10.20.0.0/16`**
+
+| Subnet | CIDR | Usable IPs | Why it exists |
+|---|---|---|---|
+| `snet-aks` | `10.20.0.0/22` | 1019 | AKS **node** IPs. With Azure CNI **Overlay**, pods do NOT consume these — so a /22 supports ~1000 nodes, wildly more than you need. Sized generously anyway because **you cannot resize a subnet that has resources in it**. |
+| `snet-appgw` | `10.20.4.0/24` | 251 | Application Gateway requires a **dedicated subnet** — nothing else may live here. Microsoft recommends /24 for autoscaling headroom. Empty in Mode A. |
+| `snet-pe` | `10.20.5.0/24` | 251 | Private Endpoint NICs (SQL, Redis, Blob, Key Vault, ACR). Separate subnet so you can apply a distinct NSG and read `az network nic list` output meaningfully. |
+| `AzureBastionSubnet` | `10.20.6.0/26` | 59 | **Name is mandatory and exact.** Minimum /26. Only if you deploy Bastion (skip in Mode A). |
+| `snet-apiserver` | `10.20.7.0/28` | 11 | API Server VNet Integration. Must be **delegated** to `Microsoft.ContainerService/managedClusters`. Optional; used on Day 4's private cluster. |
+| *(reserved)* | `10.20.8.0/21+` | — | Future: jumpbox, ACI, App Service integration |
+
+**Pod CIDR (overlay, NOT from the VNet):** `192.168.0.0/16`
+**Service CIDR:** `172.16.0.0/16` · **DNS service IP:** `172.16.0.10`
+
+**Secondary — `eastasia` — `10.21.0.0/16`** — exact mirror with `10.21.` prefixes. Non-overlapping so the VNets *could* be peered (you won't need to, but a reviewer will ask).
+
+**Azure reserves 5 addresses per subnet**: `.0` (network), `.1` (default gateway), `.2` and `.3` (Azure DNS), and the broadcast address. Same count as AWS, different assignments.
+
+### 8.2 Azure CNI: the three modes, and which to pick
+
+This is a high-value interview topic because it has no clean AWS analogue.
+
+| Mode | Pod IP source | IP consumption | When to use |
+|---|---|---|---|
+| **kubenet** (legacy) | Internal NAT'd range | Minimal | Being retired. Don't use. |
+| **Azure CNI (traditional)** | **From the VNet subnet** | Brutal — every pod takes a real VNet IP, and AKS pre-allocates `maxPods` (default 30) per node. 10 nodes = 300 IPs reserved | When pods must be directly routable from on-prem/peered VNets |
+| **Azure CNI Overlay** ✅ | Separate overlay CIDR, routed by Azure | Only **nodes** consume VNet IPs | **Default choice.** Scales to huge clusters on a small subnet |
+
+> This is the closest Azure gets to the AWS VPC CNI's ENI/secondary-IP problem — and Overlay is Azure's answer to it. In AWS you reach for prefix delegation; in Azure you reach for Overlay.
+
+**Add `--network-dataplane cilium`** ("Azure CNI Powered by Cilium") to get eBPF dataplane and **Kubernetes NetworkPolicy enforcement built in**, at no extra cost.
+
+```bash
+--network-plugin azure \
+--network-plugin-mode overlay \
+--network-dataplane cilium \
+--pod-cidr 192.168.0.0/16 \
+--service-cidr 172.16.0.0/16 \
+--dns-service-ip 172.16.0.10
+```
+
+### 8.3 Private Endpoints and Private DNS — the #1 Azure gotcha
+
+**The failure mode:** you create a Private Endpoint for Azure SQL. Your pod connects successfully. You feel good. But `nslookup azshopsql.database.windows.net` returns a **public IP**, and your traffic is going out over the internet. Nothing errors. Nothing warns you.
+
+**Why:** a Private Endpoint creates a NIC with a private IP. It does *not* automatically change DNS. You must:
+1. Create the Private DNS zone with the **exact** `privatelink.*` name.
+2. Create a **virtual network link** from that zone to your VNet.
+3. Create an **A record** in the zone pointing the resource name at the PE's private IP (Terraform's `private_dns_zone_group` does this for you).
+
+**Required zone names — these are exact strings, get one character wrong and it silently fails:**
+
+| Service | Private DNS zone name |
+|---|---|
+| Azure SQL Database | `privatelink.database.windows.net` |
+| Azure Cache for Redis | `privatelink.redis.cache.windows.net` |
+| Blob Storage | `privatelink.blob.core.windows.net` |
+| Key Vault | `privatelink.vaultcore.azure.net` |
+| ACR | `privatelink.azurecr.io` |
+| AKS private cluster | `privatelink.<region>.azmk8s.io` |
+
+**How to prove it works — run this from inside a pod, every time:**
+```bash
+kubectl run netcheck --rm -it --image=nicolaka/netshoot --restart=Never -- \
+  nslookup azshopsql-<suffix>.database.windows.net
+# CORRECT   → 10.20.5.x   (your snet-pe range)
+# BROKEN    → a public IP (usually 13.x / 20.x / 40.x)
+```
+Make this a reflex. It is the fastest way to catch a misconfigured PE.
+
+### 8.4 NSGs — how they differ from Security Groups
+
+- Attach to a **subnet** or a **NIC**. Subnet-level is the norm.
+- Rules have **priority numbers 100–4096**, evaluated low to high, first match wins.
+- Both **Allow** and **Deny** actions (a Security Group can only allow).
+- Default rules already permit: intra-VNet any-any, Azure Load Balancer probes, and outbound internet. You are overriding a permissive baseline, not building from deny-all.
+- **Service Tags** replace CIDR lists: `AzureFrontDoor.Backend`, `Internet`, `VirtualNetwork`, `AzureCloud`, `Storage.SoutheastAsia`. Use them — Microsoft maintains the IP ranges.
+
+Minimum lab NSG set:
+
+| NSG | Attached to | Key rules |
+|---|---|---|
+| `nsg-aks` | `snet-aks` | Allow 80/443 from `VirtualNetwork`; deny inbound `Internet` (priority 4000) |
+| `nsg-appgw` | `snet-appgw` | **Allow TCP 65200-65535 from `GatewayManager`** (mandatory — App Gateway v2 breaks without it); allow 80/443 from `AzureFrontDoor.Backend` only |
+| `nsg-pe` | `snet-pe` | Allow from `snet-aks` only; deny all other inbound |
+
+> **Trap:** if you omit the `GatewayManager` 65200-65535 rule, your Application Gateway will provision and then sit in an unhealthy state forever with a very unhelpful error. This is one of the most-asked Azure networking questions.
+
+### 8.5 Outbound internet — and a change you must know about
+
+Azure is **retiring default outbound access**. Historically a VM with no public IP and no NAT Gateway still got implicit outbound internet via a platform-managed SNAT address. That implicit path is going away, which means **every workload now needs an explicit egress path**.
+
+Options, cheapest first:
+1. **Load Balancer outbound rules** — ~$0.005/hr for the IP. Cheapest, but SNAT port exhaustion is a real risk under load.
+2. **NAT Gateway** — ~$0.045/hr + ~$0.045/GB. Vastly better SNAT port management, static egress IP for allowlisting. **Use this.**
+3. **Azure Firewall** — ~$900/month floor. **Never in a lab.**
+
+Set AKS explicitly: `--outbound-type userAssignedNATGateway`.
+
+### 8.6 What to skip in Mode A
+
+| Component | Mode A | Why |
+|---|---|---|
+| Azure Firewall | ❌ Skip | Cost |
+| Azure Bastion | ❌ Skip | `az aks command invoke` is free |
+| VNet peering | ❌ Skip until Day 5 | Only needed for the DR exercise, and even then Front Door routes over the public edge, not the peering |
+| `snet-appgw` | ⚠️ Create it empty | Subnets are free; creating it up front means Day 4 doesn't require a VNet change |
+| DDoS Protection Standard | ❌ Never | ~$2,900/month |
+
+---
+
+## 9. Identity and Security
+
+### 9.1 The three-layer model (internalise this)
+
+```
+Layer 1  Microsoft Entra ID       — WHO you are (authentication, tenant-wide, global)
+Layer 2  Azure RBAC               — WHAT you can do to ARM resources (control plane)
+Layer 3  Data-plane authorisation — WHAT you can do to the DATA inside a resource
+```
+
+The classic AWS-engineer mistake:
+
+> "I'm **Owner** on the subscription, why does `az keyvault secret show` return 403?"
+
+Because `Owner` is Layer 2 — it lets you *manage the vault resource*. Reading a secret is Layer 3, requiring `Key Vault Secrets User` (in the RBAC authorisation model) or an access policy entry (in the legacy model). Same for `Storage Blob Data Reader`, `AcrPull`, and `Azure Kubernetes Service RBAC Reader`. **AWS has one policy engine; Azure has three layers.**
+
+### 9.2 Managed Identity — system-assigned vs user-assigned
+
+| | System-assigned | User-assigned |
+|---|---|---|
+| Lifecycle | Tied to the parent resource; dies with it | **Standalone ARM resource** |
+| Attach to many resources | ❌ | ✅ |
+| Terraform-friendly | ⚠️ chicken-and-egg on role assignments | ✅ create identity → assign roles → attach |
+| AWS analogue | Instance profile | Closer to an IAM Role |
+
+**Use user-assigned for everything in this project.** It breaks the Terraform dependency cycle: you can create the identity and its role assignments *before* the AKS cluster exists.
+
+### 9.3 Workload Identity — the exact wiring
+
+Four things must line up. Miss any one and you get an opaque `AADSTS700213` or a hanging token request.
+
+**1. Cluster has OIDC issuer + workload identity enabled**
+```bash
+az aks update -g $RG -n $AKS --enable-oidc-issuer --enable-workload-identity
+export AKS_OIDC=$(az aks show -g $RG -n $AKS --query oidcIssuerProfile.issuerUrl -o tsv)
+```
+
+**2. Federated credential on the managed identity — subject format is exact**
+```bash
+az identity federated-credential create \
+  --name fc-azureshop-api \
+  --identity-name id-azureshop-workload \
+  --resource-group $RG \
+  --issuer "$AKS_OIDC" \
+  --subject "system:serviceaccount:azureshop:azureshop-sa" \
+  --audience api://AzureADTokenExchange
+```
+> `system:serviceaccount:<namespace>:<serviceaccount-name>` — no typos, no wildcards.
+
+**3. ServiceAccount is annotated**
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: azureshop-sa
+  namespace: azureshop
+  annotations:
+    azure.workload.identity/client-id: "<USER_ASSIGNED_MI_CLIENT_ID>"
+```
+
+**4. The POD is labelled — this is the step everyone forgets**
+```yaml
+spec:
+  template:
+    metadata:
+      labels:
+        azure.workload.identity/use: "true"   # ← without this, NO token is projected
+    spec:
+      serviceAccountName: azureshop-sa
+```
+
+The label is what tells the mutating webhook to inject `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE` and the projected token volume. The annotation alone does nothing.
+
+**Verify inside the pod:**
+```bash
+kubectl exec -n azureshop deploy/azureshop-api -- env | grep AZURE_
+kubectl exec -n azureshop deploy/azureshop-api -- ls /var/run/secrets/azure/tokens/
+```
+
+### 9.4 GitHub Actions OIDC — and why static credentials are wrong
+
+**Never do this:**
+```yaml
+- uses: azure/login@v2
+  with:
+    creds: ${{ secrets.AZURE_CREDENTIALS }}   # ❌ a long-lived client secret in a repo
+```
+
+**Why it's wrong:**
+1. **Long-lived.** A service principal secret is valid for months or years. An OIDC token is valid for minutes.
+2. **Exfiltratable.** Anyone with repo write access, or any compromised third-party Action in your workflow, can print it. A workflow log leak is permanent compromise.
+3. **No rotation story.** Rotating means editing secrets in N repos; nobody does it.
+4. **No scoping to context.** The same secret works from any branch, any workflow, a fork, or a laptop. A federated credential is bound to `repo:org/repo:environment:prod` — a PR from a fork cannot use it.
+5. **No revocation granularity.** Deleting a federated credential instantly and precisely cuts one path.
+
+**Do this instead:**
+```bash
+APP_ID=$(az ad app create --display-name "gh-azureshop-oidc" --query appId -o tsv)
+az ad sp create --id "$APP_ID"
+
+# Bind to a specific branch
+az ad app federated-credential create --id "$APP_ID" --parameters '{
+  "name": "gh-main",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:YOURUSER/azureshop:ref:refs/heads/main",
+  "audiences": ["api://AzureADTokenExchange"]
+}'
+
+# Bind to a protected GitHub Environment (approval-gated)
+az ad app federated-credential create --id "$APP_ID" --parameters '{
+  "name": "gh-env-prod",
+  "issuer": "https://token.actions.githubusercontent.com",
+  "subject": "repo:YOURUSER/azureshop:environment:prod",
+  "audiences": ["api://AzureADTokenExchange"]
+}'
+
+# Scope RBAC to the resource group, NOT the subscription
+SP_ID=$(az ad sp show --id "$APP_ID" --query id -o tsv)
+az role assignment create --assignee-object-id "$SP_ID" \
+  --assignee-principal-type ServicePrincipal \
+  --role "Contributor" \
+  --scope "/subscriptions/$SUB_ID/resourceGroups/rg-azshop-lab-sea"
+```
+
+The only things stored in GitHub are `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` — **all three are non-secret identifiers**. There is no credential to steal.
+
+### 9.5 Key Vault — two traps
+
+**Trap 1: the RBAC vs access-policy fork.** Vaults have two authorisation models. Use **RBAC** (`enable_rbac_authorization = true`) — it's the modern default and consistent with everything else. Then grant `Key Vault Secrets User` to your workload identity and `Key Vault Secrets Officer` to yourself.
+
+**Trap 2: soft-delete will break your rebuild loop.** Soft-delete is on by default with a 7–90 day retention. A deleted vault **reserves its name globally**. Your `terraform destroy && terraform apply` on Day 2 will fail with *"vault name is already in use"*.
+
+Two mitigations, use both:
+```hcl
+# In the module — allow Terraform to reclaim a soft-deleted vault
+provider "azurerm" {
+  features {
+    key_vault {
+      purge_soft_delete_on_destroy    = true
+      recover_soft_deleted_key_vaults = true
+    }
+  }
+}
+```
+```bash
+# And keep names unique per build with a random suffix
+az keyvault list-deleted -o table
+az keyvault purge --name kv-azshop-<suffix> --location southeastasia
+```
+> **Note:** if **purge protection** is enabled you *cannot* purge early — you must wait out the retention period. **Do not enable purge protection in a lab.** In production you absolutely should.
+
+---
+
+## 10. AKS Design
+
+### 10.1 Cluster configuration and the reasoning
+
+| Setting | Lab value | Production value | Why |
+|---|---|---|---|
+| SKU tier | `Free` | `Standard` | Free = $0/hr, no SLA, recommended <10 nodes. Standard = $0.10/cluster/hr for a 99.95% API server SLA. You cannot use an SLA in a lab. |
+| K8s version | Latest stable minus one minor | Same, with a documented n-1 policy | Newest minor often lacks add-on parity |
+| Network plugin | `azure` + `overlay` + `cilium` | Same | Overlay keeps VNet IPs free; Cilium gives NetworkPolicy at no cost |
+| API server access | Public + `--api-server-authorized-ip-ranges <your-ip>/32` | **Private cluster** | Lab compromise: real access control, no Bastion cost. Build one private cluster on Day 4 to prove the pattern |
+| Outbound | `userAssignedNATGateway` | Same | Default outbound access is being retired |
+| System node pool | 1 × `Standard_B2ms`, no zones | 3 × `Standard_D4ds_v5`, zones 1,2,3 | System pool runs CoreDNS/metrics-server/konnectivity. It cannot be Spot. |
+| User node pool | 1 × `Standard_B2ms`, autoscale 1→3 | 3+ × `Standard_D4ds_v5`, zones 1,2,3 | Scale up only for the HPA lab |
+| System pool taint | `CriticalAddonsOnly=true:NoSchedule` | Same | Keeps app pods off the system pool — a real production practice |
+| Add-ons | `azure-keyvault-secrets-provider`, `monitoring`, app routing | Same + Defender | |
+| Identity | User-assigned MI + Workload Identity + OIDC issuer | Same | |
+
+### 10.2 Why `Standard_B2ms`
+
+2 vCPU / 8 GB, burstable, ~$0.083/hr. Reasoning:
+- **4 GB is not enough.** After the kubelet, OS, and AKS system reservations, a B2s (4 GB) leaves ~2 GB allocatable — the store demo won't fit.
+- **Free-trial vCPU quota is often 4 total.** Two B2ms nodes = exactly 4 vCPU. Check first (§7.3 Rule 5).
+- Burstable is fine because a lab is bursty by nature.
+
+If quota allows and you want realism, `Standard_D2ads_v6` is a better production-shaped choice at ~1.3× the price.
+
+### 10.3 Zones — the Azure-specific twist
+
+Because **subnets are regional**, you don't need three subnets for three zones. You pass `--zones 1 2 3` to the *node pool* and AKS spreads VMSS instances across zones within the same subnet.
+
+**But:** you need at least 3 nodes to actually observe zone spread, so run this only during the Day 4 HA lab, then scale back to 1.
+
+```bash
+# During the HA lab only
+az aks nodepool scale -g $RG --cluster-name $AKS -n user --node-count 3
+kubectl get nodes -L topology.kubernetes.io/zone
+# Expect: southeastasia-1, southeastasia-2, southeastasia-3
+```
+
+### 10.4 Ingress — a genuinely important current decision
+
+This is a live, changing area and a strong interview differentiator.
+
+**What happened:** Kubernetes SIG Network and the Security Response Committee retired the **Ingress NGINX** project, with upstream maintenance ending **March 2026**. Existing deployments keep working and artifacts remain available, but there are no more releases, bug fixes, or security patches. AKS is providing a support bridge: critical security patches for the **application routing add-on's** managed NGINX through **November 2026**. AKS is aligning with upstream on **Gateway API** as the long-term standard.
+
+As of AKS release **v20260428 (28 April 2026)**, both managed Gateway API (`--enable-gateway-api`) and the app routing Istio Gateway API implementation (`--enable-app-routing-istio`) are **generally available**.
+
+**Your three options, and what each teaches:**
+
+| Option | Cost | Use it for |
+|---|---|---|
+| **App routing add-on (managed NGINX)** | ~$0.13/day (one LB + IP) | **Day 2.** Fastest path to a working ingress. Supported through Nov 2026. |
+| **App routing Gateway API (Istio-based)** | Same | **Day 3 [CORE].** The modern answer. Learn `GatewayClass` / `Gateway` / `HTTPRoute`. This is what makes you sound current. |
+| **Application Gateway + AGIC** *or* **Application Gateway for Containers** | ~$10.60/day | **Day 4 only.** Azure-native L7 + WAF. Note AGC is the AGIC successor, supports both Ingress and Gateway API, but currently **external frontends only** — no private IP. AGIC still supports internal frontends. |
+
+**Interview answer to have ready:** *"We were on standalone ingress-nginx. When SIG Network retired it in March 2026 we moved to the AKS application routing add-on to buy supported time through November 2026, and in parallel piloted the Gateway API implementation. Long term we're on Gateway API — either app routing's Istio-based implementation or Application Gateway for Containers, depending on whether we need Azure-native WAF at the ingress."*
+
+### 10.5 Reliability primitives — and why each
+
+| Primitive | Lab value | Why |
+|---|---|---|
+| **Resource requests/limits** | `requests: 50m/64Mi`, `limits: 500m/256Mi` | Requests drive scheduling and the Cluster Autoscaler. **No requests = no scale-out.** Keep requests low so several pods fit a B2ms. |
+| **HPA** | min 2, max 6, CPU 60% | Needs `metrics-server` (present by default) and CPU **requests** set |
+| **PDB** | `minAvailable: 1` | Protects against voluntary disruption (node drain / upgrade). **Trap:** `minAvailable: 1` with `replicas: 1` blocks node drains forever. |
+| **topologySpreadConstraints** | `maxSkew: 1` over `topology.kubernetes.io/zone`, `whenUnsatisfiable: ScheduleAnyway` | Spreads across AZs. Use `ScheduleAnyway` in a 1-node lab or pods go Pending. |
+| **podAntiAffinity** | `preferredDuringScheduling` on `kubernetes.io/hostname` | Avoids all replicas on one node. `preferred`, not `required`, or a 1-node cluster deadlocks. |
+| **Taints/tolerations** | System pool: `CriticalAddonsOnly=true:NoSchedule` | Keeps workloads off the system pool |
+| **Probes** | startup → liveness → readiness | See §15 for why all three |
+
+---
+
+## 11. Container Platform (ACR)
+
+### 11.1 Pipeline
+
+```mermaid
+flowchart LR
+    A["git push"] --> B["GitHub Actions"]
+    B --> C["docker buildx build<br/>--platform linux/amd64"]
+    C --> D["Trivy scan<br/>exit-code 1 on HIGH/CRITICAL"]
+    D --> E["az acr login<br/>(OIDC, no password)"]
+    E --> F["push :git-sha AND :v1.2.3"]
+    F --> G["kubectl set image<br/>with immutable :git-sha"]
+    G --> H["kubectl rollout status<br/>--timeout=180s"]
+    H -->|fail| I["kubectl rollout undo"]
+```
+
+### 11.2 Tagging strategy
+
+| Tag | Example | Used for |
+|---|---|---|
+| **Immutable git SHA** | `azureshop-api:a3f9c2e` | **What deployments actually reference.** Never overwritten. Reproducible. Rollback = point at the old SHA. |
+| Semantic version | `azureshop-api:1.4.0` | Human-readable release marker |
+| `latest` | — | ❌ **Never in a manifest.** `imagePullPolicy: Always` + `latest` gives you undebuggable drift where two pods of the same Deployment run different code. |
+
+**Enable ACR immutable tags** so a tag can never be re-pointed:
+```bash
+az acr config retention update -r $ACR --status enabled --days 7 --type UntaggedManifests
+az acr repository update -n $ACR --repository azureshop-api --write-enabled true
+```
+
+### 11.3 ACR authentication — three ways, one right answer
+
+| Method | Verdict |
+|---|---|
+| Admin user (`--admin-enabled`) | ❌ A shared static password. Disable it. |
+| Service principal + imagePullSecret | ⚠️ Works, but it's a stored credential |
+| **AKS kubelet identity granted `AcrPull`** | ✅ **Correct.** No secret, no imagePullSecret. |
+
+```bash
+az aks update -g $RG -n $AKS --attach-acr $ACR
+# Equivalent to: role assignment "AcrPull" for the kubelet identity, scoped to the ACR
+```
+
+**Verify:**
+```bash
+KUBELET_ID=$(az aks show -g $RG -n $AKS --query identityProfile.kubeletidentity.objectId -o tsv)
+az role assignment list --assignee "$KUBELET_ID" --scope $(az acr show -n $ACR --query id -o tsv) -o table
+```
+
+### 11.4 ACR geo-replication — the key difference from ECR
+
+With ECR you manage per-region registries plus replication rules; images have different URIs per region. With **ACR Premium geo-replication** there is **one registry object with replicas**, and `myreg.azurecr.io` resolves via Azure Traffic Manager to the nearest replica. Your Kubernetes manifests are **identical in both regions**. That's a genuine architectural advantage worth stating in an interview.
+
+```bash
+# Day 5 only, ~$50/month prorated — about $0.07/hour
+az acr update -n $ACR --sku Premium
+az acr replication create -r $ACR -l eastasia
+# ... demo, screenshot ...
+az acr replication delete -r $ACR -l eastasia
+az acr update -n $ACR --sku Basic
+```
+
+---
+
+## 12. The Application — What to Host
+
+You asked for GitHub sample apps. Here is the recommendation, and the reasoning: **use a ready-made polyglot app for the platform work, and one tiny custom app for the Azure-specific work.**
+
+### 12.1 Primary workload — `Azure-Samples/aks-store-demo` ⭐ RECOMMENDED
+
+**Repo:** https://github.com/Azure-Samples/aks-store-demo
+
+Microsoft's own AKS demo app. Containerised polyglot microservices with an event-driven design, meant to show a realistic scenario on AKS.
+
+| Service | Language | Maps to your AzureShop requirement |
+|---|---|---|
+| `store-front` | Vue.js | **Frontend** |
+| `store-admin` | Vue.js | Second frontend (multi-ingress-route practice) |
+| `order-service` | JavaScript | **Backend API** |
+| `product-service` | Rust | **Backend API** |
+| `makeline-service` | Go | **Worker** (consumes the order queue) |
+| `virtual-customer` | Rust | Load generator (free traffic for your dashboards!) |
+| `virtual-worker` | Rust | Load generator |
+| `rabbitmq` | — | Queue |
+| `mongodb` / `documentdb` | — | Database |
+
+**Why this one:**
+- **One command to running.** Public images on `ghcr.io`, no build step, no registry auth needed for the first deploy.
+- `virtual-customer` and `virtual-worker` generate continuous synthetic traffic — your Grafana dashboards and HPA labs have real data with zero effort.
+- Polyglot means realistic multi-container troubleshooting.
+- It has a documented `Ingress` option, Helm charts, and Kustomize overlays.
+
+**Deploy it in 30 seconds:**
+```bash
+kubectl create namespace pets
+kubectl apply -n pets \
+  -f https://raw.githubusercontent.com/Azure-Samples/aks-store-demo/main/aks-store-all-in-one.yaml
+kubectl get pods -n pets -w
+```
+
+**Known issues to expect** (they're in the repo's issue tracker, and debugging them *is* the exercise): `order-service` can land in `CrashLoopBackOff` if RabbitMQ isn't ready yet, and image pulls fail if you've rewritten images to a private ACR without `AcrPull`. Both are on your troubleshooting list anyway.
+
+### 12.2 Secondary workload — `azureshop-api` (custom, ~80 lines)
+
+The store demo uses MongoDB and RabbitMQ, not Azure SQL / Redis / Blob. So write **one small service** whose entire purpose is to exercise the Azure data plane through Workload Identity. This is what your CI/CD pipeline builds and what proves the identity chain.
+
+Full source is in §15.3. It exposes:
+
+| Endpoint | Proves |
+|---|---|
+| `GET /healthz` | Liveness |
+| `GET /readyz` | Readiness — checks SQL + Redis + Blob reachability |
+| `GET /secret` | **Key Vault read via Workload Identity, no secret mounted** |
+| `GET /cache` | Redis via Private Endpoint |
+| `GET /db` | Azure SQL via Private Endpoint |
+| `POST /upload` | Blob write via Managed Identity (no connection string) |
+| `GET /burn?seconds=30` | CPU load → triggers HPA |
+| `GET /crash` | Forces exit → CrashLoopBackOff demo |
+| `GET /metrics` | Prometheus scrape target |
+
+### 12.3 Alternatives, if you prefer something else
+
+| Repo | Notes |
+|---|---|
+| `Azure-Samples/azure-voting-app-redis` | The classic 2-tier AKS demo (Python + Redis). Simplest possible thing; good if you're short on time. |
+| `GoogleCloudPlatform/microservices-demo` (Online Boutique) | 11 microservices, excellent for observability and service mesh labs. Heavier — needs ~4 vCPU, likely over free-trial quota. |
+| `Azure-Samples/contoso-air` | .NET/Node travel app, good for App Service comparisons. |
+
+**Verdict: `aks-store-demo` + `azureshop-api`.** Zero business logic to write, maximum Azure surface exercised.
+
+---
+
+## 13. Terraform Architecture
+
+### 13.1 Repository structure
+
+```
+azureshop/
+├── bootstrap/                  # Run ONCE with local state, creates the remote backend
+│   └── main.tf
+├── modules/
+│   ├── network/                # VNet, subnets, NSGs, NAT GW, private DNS zones
+│   ├── identity/               # user-assigned MIs, role assignments, federated creds
+│   ├── acr/
+│   ├── keyvault/
+│   ├── aks/
+│   ├── data/                   # SQL + Redis + Storage + their private endpoints
+│   ├── observability/          # Log Analytics, Azure Monitor workspace, Grafana
+│   ├── edge/                   # Application Gateway + WAF   (production mode only)
+│   └── frontdoor/              # Front Door + WAF policy     (production mode only)
+├── envs/
+│   ├── lab/                    # region 1 — the thing you run every day
+│   │   ├── main.tf  variables.tf  outputs.tf  backend.tf  terraform.tfvars
+│   └── dr/                     # region 2 — Day 5 only, SEPARATE state
+├── k8s/
+│   ├── base/                   # Kustomize base
+│   └── overlays/{lab,dr}/
+├── app/                        # azureshop-api source + Dockerfile
+├── .github/workflows/
+└── scripts/
+    ├── audit-cost.sh
+    └── nuke.sh
+```
+
+**Improvements over the structure you proposed:**
+1. **Added `bootstrap/`.** The chicken-and-egg problem — you need a storage account for remote state before you can use remote state. Solve it explicitly with a tiny local-state config.
+2. **`envs/lab` and `envs/dr` instead of dev/staging/prod.** You have 5 days. Three near-identical environments is ceremony, not learning. The *interesting* axis here is **region**, not environment tier.
+3. **Renamed `gateway` → `edge`.** "Gateway" is overloaded in Azure (App Gateway, NAT Gateway, VPN Gateway, Gateway API).
+4. **`data/` groups SQL+Redis+Storage.** They share the same private endpoint + private DNS pattern; splitting them triples the boilerplate.
+
+### 13.2 Separate state vs workspaces — and the answer
+
+| | Workspaces | Separate state files |
+|---|---|---|
+| Blast radius | One backend key; a bad `terraform destroy` in the wrong workspace is easy | Isolated |
+| Provider config | Can't vary provider `features` per workspace cleanly | Fully independent |
+| Multi-region | Awkward — region becomes a variable branching everywhere | Natural |
+
+**Use separate state files per region.** `envs/lab` → `lab.terraform.tfstate`, `envs/dr` → `dr.terraform.tfstate`. This is also what most teams actually do, and the reason is exactly the one that bites: you want a hard boundary so `terraform destroy` in DR can never touch primary.
+
+**Reserve workspaces for**: near-identical short-lived copies of the *same* config (e.g. per-PR ephemeral environments).
+
+### 13.3 State backend — the AWS difference
+
+```hcl
+# envs/lab/backend.tf
+terraform {
+  required_version = ">= 1.9.0"
+  required_providers {
+    azurerm = { source = "hashicorp/azurerm", version = "~> 4.0" }
+    azuread = { source = "hashicorp/azuread", version = "~> 3.0" }
+    random  = { source = "hashicorp/random",  version = "~> 3.6" }
+  }
+  backend "azurerm" {
+    resource_group_name  = "rg-azshop-tfstate"
+    storage_account_name = "stazshoptfstateXXXX"   # replace with your suffix
+    container_name       = "tfstate"
+    key                  = "lab.terraform.tfstate"
+    use_azuread_auth     = true                     # auth via your az login, no storage key
+  }
+}
+```
+
+**Key difference from AWS:** no DynamoDB lock table. The `azurerm` backend uses a **blob lease** for locking natively. One less resource, one less thing to forget. If a run crashes and leaves a lease, `terraform force-unlock <ID>` releases it.
+
+**`use_azuread_auth = true`** means Terraform authenticates to the storage account with your Entra ID identity rather than a storage account access key — so you can disable shared key access entirely. Grant yourself `Storage Blob Data Contributor` on the state container.
+
+### 13.4 Two-mode deployment (the `mode` variable)
+
+This is the mechanism the whole cost strategy hangs on. It's plain `count` — no invented Terraform features.
+
+```hcl
+# envs/lab/variables.tf
+variable "mode" {
+  description = "lab = cheap always-on subset; production = full edge stack (EXPENSIVE)"
+  type        = string
+  default     = "lab"
+  validation {
+    condition     = contains(["lab", "production"], var.mode)
+    error_message = "mode must be 'lab' or 'production'."
+  }
+}
+```
+
+```hcl
+# envs/lab/main.tf  (excerpt)
+locals {
+  is_prod = var.mode == "production"
+}
+
+# ---- Always deployed ----
+module "network"  { source = "../../modules/network"  ... }
+module "identity" { source = "../../modules/identity" ... }
+module "acr"      { source = "../../modules/acr"      ... }
+module "keyvault" { source = "../../modules/keyvault" ... }
+module "aks"      { source = "../../modules/aks"      ... }
+module "data"     { source = "../../modules/data"     ... }
+
+# ---- EXPENSIVE: only when mode = production ----
+module "edge" {
+  source              = "../../modules/edge"
+  count               = local.is_prod ? 1 : 0        # ~$10.60/day when on
+  resource_group_name = azurerm_resource_group.this.name
+  location            = var.location
+  subnet_id           = module.network.appgw_subnet_id
+  tags                = local.tags
+}
+
+module "frontdoor" {
+  source              = "../../modules/frontdoor"
+  count               = local.is_prod ? 1 : 0        # ~$1.15/day (Standard)
+  resource_group_name = azurerm_resource_group.this.name
+  origin_hostname     = local.is_prod ? module.edge[0].public_fqdn : null
+  tags                = local.tags
+}
+```
+
+Daily use:
+```bash
+terraform apply                              # ~$3/day  — Mode A
+terraform apply -var="mode=production"       # ~$15/day — Mode B, SET A TIMER
+terraform apply -var="mode=lab"              # back down — the edge modules are destroyed
+```
+
+> **⚠️ WARNING before every `-var="mode=production"`:** this creates an Application Gateway that bills from the moment it exists. Set a phone alarm for +3 hours *before* you run it.
+
+### 13.5 Naming and tagging
+
+```hcl
+locals {
+  prefix    = "azshop"
+  env       = "lab"
+  loc_short = { southeastasia = "sea", eastasia = "eas" }[var.location]
+
+  tags = {
+    Project     = "AzureShop"
+    Environment = local.env
+    ManagedBy   = "Terraform"
+    Owner       = var.owner
+    Lifecycle   = "ephemeral"
+    DestroyBy   = var.destroy_by   # "2026-09-12"
+    CostCenter  = "personal-lab"
+  }
+}
+```
+
+| Resource | Pattern | Example |
+|---|---|---|
+| Resource Group | `rg-<prefix>-<env>-<loc>` | `rg-azshop-lab-sea` |
+| VNet | `vnet-<prefix>-<env>-<loc>` | `vnet-azshop-lab-sea` |
+| Subnet | `snet-<purpose>` | `snet-aks` |
+| NSG | `nsg-<purpose>` | `nsg-appgw` |
+| AKS | `aks-<prefix>-<env>-<loc>` | `aks-azshop-lab-sea` |
+| ACR | `acr<prefix><env><suffix>` | `acrazshoplab7f3a` (**alphanumeric only, globally unique, 5–50 chars**) |
+| Key Vault | `kv-<prefix>-<suffix>` | `kv-azshop-7f3a` (**globally unique, 3–24 chars**) |
+| Storage | `st<prefix><env><suffix>` | `stazshoplab7f3a` (**lowercase alphanumeric only, 3–24 chars, globally unique**) |
+| SQL Server | `sql-<prefix>-<env>-<suffix>` | `sql-azshop-lab-7f3a` |
+| Managed Identity | `id-<purpose>` | `id-azureshop-workload` |
+
+Globally-unique names need a suffix — use `random_string`:
+```hcl
+resource "random_string" "suffix" {
+  length  = 4
+  special = false
+  upper   = false
+}
+```
+
+### 13.6 Secrets in Terraform
+
+**Rules:**
+1. Never `variable "sql_password" { default = "..." }`.
+2. Generate with `random_password`, write straight into Key Vault, never output it.
+3. Mark outputs `sensitive = true`.
+4. **Remember: state contains secrets in plaintext.** Your state storage account must have public network access disabled and RBAC-only auth.
+
+```hcl
+resource "random_password" "sql_admin" {
+  length      = 32
+  special     = true
+  min_upper   = 1
+  min_lower   = 1
+  min_numeric = 1
+}
+
+resource "azurerm_key_vault_secret" "sql_conn" {
+  name         = "sql-connection-string"
+  key_vault_id = module.keyvault.id
+  value        = "Server=tcp:${azurerm_mssql_server.this.fully_qualified_domain_name},1433;Database=${azurerm_mssql_database.this.name};User ID=${var.sql_admin_user};Password=${random_password.sql_admin.result};Encrypt=true;"
+  content_type = "connection-string"
+}
+```
+The app then reads `sql-connection-string` from Key Vault via Workload Identity. The password exists in exactly two places: Terraform state and Key Vault. Never in Git, never in a manifest, never in an env var in a YAML file.
+
+### 13.7 Implementation order and why
+
+```mermaid
+flowchart TD
+    A["1. bootstrap: RG + storage account for state"] --> B["2. Resource group + tags + budget"]
+    B --> C["3. Network: VNet, subnets, NSGs, NAT GW,<br/>private DNS zones + VNet links"]
+    C --> D["4. Identity: user-assigned MIs"]
+    D --> E["5. Key Vault + private endpoint"]
+    E --> F["6. ACR + private endpoint"]
+    F --> G["7. AKS<br/>needs: subnet, MI, ACR (AcrPull), Log Analytics"]
+    C --> H["8. Data: SQL, Redis, Storage<br/>+ private endpoints into snet-pe"]
+    B --> I["9. Observability: Log Analytics<br/>(BEFORE AKS — AKS references its ID)"]
+    G --> J["10. Federated credentials<br/>needs the AKS OIDC issuer URL"]
+    J --> K["11. Kubernetes workloads"]
+    G --> L["12. Application Gateway (prod mode)"]
+    L --> M["13. Front Door (prod mode)"]
+    M --> N["14. DR region (separate state)"]
+```
+
+**The dependencies that actually matter:**
+- **Log Analytics must exist before AKS** — the monitoring add-on takes a workspace resource ID at cluster creation.
+- **Private DNS zones must be linked to the VNet before the private endpoints** — otherwise the `private_dns_zone_group` has nothing to write into.
+- **Federated credentials must come after AKS** — the subject needs the cluster's OIDC issuer URL, which doesn't exist until the cluster does. This is why the *identity* is created early (step 4) but the *federation* is late (step 10).
+- **ACR before AKS** if you use `--attach-acr` at creation; otherwise attach afterwards.
+- **App Gateway needs its dedicated empty subnet** to already exist.
+
+---
+
+## 14. GitHub Actions + OIDC
+
+### 14.1 Repository secrets and variables
+
+**GitHub → Settings → Secrets and variables → Actions → Variables** (not Secrets — none of these are secret):
+
+| Name | Value |
+|---|---|
+| `AZURE_CLIENT_ID` | App registration appId |
+| `AZURE_TENANT_ID` | Tenant ID |
+| `AZURE_SUBSCRIPTION_ID` | Subscription ID |
+| `ACR_NAME` | e.g. `acrazshoplab7f3a` |
+| `AKS_NAME` | `aks-azshop-lab-sea` |
+| `RG_NAME` | `rg-azshop-lab-sea` |
+
+**Zero secrets stored.** That's the point.
+
+### 14.2 Infrastructure workflow
+
+`.github/workflows/infra.yml`
+
+```yaml
+name: infra
+
+on:
+  pull_request:
+    paths: ['envs/**', 'modules/**']
+  push:
+    branches: [main]
+    paths: ['envs/**', 'modules/**']
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'lab (cheap) or production (EXPENSIVE - App Gateway ~$10.60/day)'
+        required: true
+        default: 'lab'
+        type: choice
+        options: [lab, production]
+
+permissions:
+  id-token: write        # REQUIRED for OIDC - without this the token request fails
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: '1.9.8'
+  WORKING_DIR: envs/lab
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+      - name: terraform init (no backend)
+        run: terraform init -backend=false
+        working-directory: ${{ env.WORKING_DIR }}
+      - name: terraform validate
+        run: terraform validate
+        working-directory: ${{ env.WORKING_DIR }}
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          soft_fail: true          # start soft; tighten once you've triaged findings
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          soft_fail: true
+
+  plan:
+    needs: [validate, security-scan]
+    runs-on: ubuntu-latest
+    environment: lab
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        run: terraform init
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_USE_OIDC:         'true'
+          ARM_CLIENT_ID:        ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID:        ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID:  ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: terraform plan
+        id: plan
+        run: |
+          terraform plan \
+            -var="mode=${{ inputs.mode || 'lab' }}" \
+            -out=tfplan -no-color | tee plan.txt
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_USE_OIDC:        'true'
+          ARM_CLIENT_ID:       ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID:       ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ env.WORKING_DIR }}/plan.txt', 'utf8');
+            const body = '### Terraform Plan\n```\n' + plan.slice(0, 60000) + '\n```';
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.WORKING_DIR }}/tfplan
+          retention-days: 1
+
+  apply:
+    needs: plan
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: prod        # <- GitHub Environment with a REQUIRED REVIEWER = the approval gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.WORKING_DIR }}
+      - run: terraform init
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_USE_OIDC: 'true'
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - run: terraform apply -auto-approve tfplan
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_USE_OIDC: 'true'
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+```
+
+> **The single most common OIDC failure** is forgetting `permissions: id-token: write`. Without it the runner cannot mint an OIDC token and `azure/login` fails with `Unable to get ACTIONS_ID_TOKEN_REQUEST_URL`.
+
+### 14.3 Application workflow
+
+`.github/workflows/app.yml`
+
+```yaml
+name: app
+
+on:
+  push:
+    branches: [main]
+    paths: ['app/**', 'k8s/**']
+  pull_request:
+    paths: ['app/**']
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-scan-push:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (local, not pushed yet - scan before push)
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          push: false
+          load: true
+          tags: azureshop-api:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Trivy scan - FAIL the build on HIGH/CRITICAL
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: azureshop-api:${{ steps.meta.outputs.tag }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'HIGH,CRITICAL'
+
+      - uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login (token from OIDC session - no password anywhere)
+        run: az acr login --name ${{ vars.ACR_NAME }}
+
+      - name: Tag and push immutable
+        if: github.ref == 'refs/heads/main'
+        run: |
+          IMG=${{ vars.ACR_NAME }}.azurecr.io/azureshop-api
+          docker tag azureshop-api:${{ steps.meta.outputs.tag }} $IMG:${{ steps.meta.outputs.tag }}
+          docker push $IMG:${{ steps.meta.outputs.tag }}
+
+  deploy:
+    needs: build-scan-push
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: prod                  # approval gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get kubeconfig
+        run: |
+          az aks get-credentials -g ${{ vars.RG_NAME }} -n ${{ vars.AKS_NAME }} --overwrite-existing
+          kubelogin convert-kubeconfig -l azurecli
+
+      - name: Deploy with immutable tag
+        run: |
+          kubectl -n azureshop set image deployment/azureshop-api \
+            api=${{ vars.ACR_NAME }}.azurecr.io/azureshop-api:${{ needs.build-scan-push.outputs.image_tag }}
+
+      - name: Wait for rollout, auto-rollback on failure
+        run: |
+          if ! kubectl -n azureshop rollout status deployment/azureshop-api --timeout=180s; then
+            echo "::error::Rollout failed - rolling back"
+            kubectl -n azureshop rollout undo deployment/azureshop-api
+            kubectl -n azureshop rollout status deployment/azureshop-api --timeout=180s
+            exit 1
+          fi
+
+      - name: Smoke test
+        run: |
+          kubectl -n azureshop run smoke --rm -i --restart=Never --image=curlimages/curl:8.10.1 -- \
+            curl -fsS --max-time 10 http://azureshop-api.azureshop.svc.cluster.local:8000/readyz
+```
+
+**Note on GitHub-hosted runners and private clusters:** if you make the AKS API server private, a GitHub-hosted runner cannot reach it. Your three options are (a) `az aks command invoke` from the runner, (b) a self-hosted runner inside the VNet, or (c) GitHub Actions private networking. For the lab, option (a):
+```bash
+az aks command invoke -g $RG -n $AKS --command "kubectl -n azureshop rollout status deploy/azureshop-api"
+```
+
+### 14.4 Deployment strategy
+
+For 5 days, **rolling update with `maxUnavailable: 0`** is the right call — it gives you zero-downtime deploys without extra infrastructure:
+```yaml
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0     # never dip below desired replicas
+    maxSurge: 1
+```
+Mention blue/green and canary in interviews (Front Door weighted origin groups can do a real canary — 90/10 weights across two origins), but don't build them here. It costs a day you don't have.
+
+---
+
+## 15. Kubernetes Manifests
+
+### 15.1 Namespace, ServiceAccount, and the Workload Identity wiring
+
+```yaml
+# k8s/base/00-namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: azureshop
+  labels:
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: azureshop-sa
+  namespace: azureshop
+  annotations:
+    azure.workload.identity/client-id: "REPLACE_WITH_MI_CLIENT_ID"
+```
+
+### 15.2 Deployment — every field justified
+
+```yaml
+# k8s/base/10-api-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: azureshop-api
+  namespace: azureshop
+  labels: { app: azureshop-api }
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels: { app: azureshop-api }
+  template:
+    metadata:
+      labels:
+        app: azureshop-api
+        azure.workload.identity/use: "true"   # ← MANDATORY. No token without it.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: azureshop-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+
+      # Keep app pods off the tainted system node pool
+      nodeSelector:
+        agentpool: user
+
+      # Prefer, not require - a 1-node lab cluster would deadlock on 'required'
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: { app: azureshop-api }
+
+      # Spread across AZs. ScheduleAnyway so a 1-node cluster still schedules.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: azureshop-api }
+
+      containers:
+        - name: api
+          image: REPLACE_ACR.azurecr.io/azureshop-api:REPLACE_SHA   # NEVER :latest
+          imagePullPolicy: IfNotPresent
+          ports: [{ containerPort: 8000, name: http }]
+
+          env:
+            - name: KEYVAULT_URI
+              valueFrom: { configMapKeyRef: { name: azureshop-config, key: keyvault_uri } }
+            - name: REDIS_HOST
+              valueFrom: { configMapKeyRef: { name: azureshop-config, key: redis_host } }
+            - name: STORAGE_ACCOUNT
+              valueFrom: { configMapKeyRef: { name: azureshop-config, key: storage_account } }
+            - name: OTEL_SERVICE_NAME
+              value: azureshop-api
+            - name: APPLICATIONINSIGHTS_CONNECTION_STRING
+              valueFrom: { secretKeyRef: { name: appinsights, key: connection-string } }
+
+          # Requests drive BOTH scheduling and the Cluster Autoscaler and the HPA.
+          # No requests = no autoscaling at all. Keep them small so pods fit a B2ms.
+          resources:
+            requests: { cpu: "50m",  memory: "96Mi" }
+            limits:   { cpu: "500m", memory: "256Mi" }
+
+          # Startup: gives a slow-starting app up to 60s WITHOUT a lax liveness threshold
+          startupProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 5
+            failureThreshold: 12
+          # Liveness: is the process wedged? Restart it. Keep it CHEAP - never touch a DB here,
+          # or a database blip will cascade into a cluster-wide restart storm.
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8000 }
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Readiness: should this pod receive traffic? THIS one checks dependencies.
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8000 }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: tmp, mountPath: /tmp }
+            - { name: kvsecrets, mountPath: /mnt/secrets, readOnly: true }
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: kvsecrets                       # Key Vault CSI driver
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: azureshop-kv
+```
+
+**The probe reasoning, since it's an interview favourite:**
+- **Startup probe exists so liveness doesn't have to be lenient.** Without it you'd need `initialDelaySeconds: 60` on liveness, which means a genuinely hung pod takes 60+ seconds to be restarted for its whole life.
+- **Liveness must not check dependencies.** If liveness hits the database, one DB outage restarts every pod simultaneously — turning a degraded service into a total outage.
+- **Readiness must check dependencies.** That's exactly its job: remove this pod from the Service endpoints while it can't serve.
+
+### 15.3 The `azureshop-api` application
+
+`app/main.py`:
+
+```python
+import os, time, logging
+from fastapi import FastAPI, Response
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
+from azure.storage.blob import BlobServiceClient
+import redis
+
+logging.basicConfig(level=logging.INFO)
+app = FastAPI(title="azureshop-api")
+
+# DefaultAzureCredential picks up the Workload Identity env vars automatically:
+# AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_FEDERATED_TOKEN_FILE, AZURE_AUTHORITY_HOST
+cred = DefaultAzureCredential()
+
+KV_URI    = os.getenv("KEYVAULT_URI", "")
+REDIS_HOST= os.getenv("REDIS_HOST", "")
+STORAGE   = os.getenv("STORAGE_ACCOUNT", "")
+
+_kv    = SecretClient(vault_url=KV_URI, credential=cred) if KV_URI else None
+_blob  = BlobServiceClient(f"https://{STORAGE}.blob.core.windows.net", credential=cred) if STORAGE else None
+_redis = redis.Redis(host=REDIS_HOST, port=6380, ssl=True,
+                     password=os.getenv("REDIS_KEY"), socket_timeout=3) if REDIS_HOST else None
+
+REQS = {"total": 0, "errors": 0}
+
+@app.middleware("http")
+async def count(request, call_next):
+    REQS["total"] += 1
+    resp = await call_next(request)
+    if resp.status_code >= 500:
+        REQS["errors"] += 1
+    return resp
+
+@app.get("/healthz")           # liveness - process only, no dependencies
+def healthz():
+    return {"status": "ok"}
+
+@app.get("/readyz")            # readiness - dependencies
+def readyz():
+    checks = {}
+    try:
+        _redis.ping(); checks["redis"] = "ok"
+    except Exception as e:
+        checks["redis"] = f"fail: {e}"
+    try:
+        _kv.get_secret("sql-connection-string"); checks["keyvault"] = "ok"
+    except Exception as e:
+        checks["keyvault"] = f"fail: {e}"
+    ok = all(v == "ok" for v in checks.values())
+    return Response(content=str(checks), status_code=200 if ok else 503)
+
+@app.get("/secret")            # PROVES Workload Identity -> Key Vault, no mounted secret
+def secret():
+    s = _kv.get_secret("demo-secret")
+    return {"name": s.name, "length": len(s.value), "source": "keyvault-via-workload-identity"}
+
+@app.get("/cache")             # PROVES Redis over Private Endpoint
+def cache():
+    _redis.set("azureshop:hits", _redis.incr("azureshop:counter"))
+    return {"counter": int(_redis.get("azureshop:counter"))}
+
+@app.post("/upload")           # PROVES Blob via Managed Identity, no connection string
+def upload():
+    name = f"probe-{int(time.time())}.txt"
+    _blob.get_blob_client("uploads", name).upload_blob(b"azureshop probe", overwrite=True)
+    return {"uploaded": name}
+
+@app.get("/burn")              # HPA trigger
+def burn(seconds: int = 30):
+    end = time.time() + min(seconds, 120)
+    while time.time() < end:
+        _ = sum(i * i for i in range(20000))
+    return {"burned": seconds}
+
+@app.get("/crash")             # CrashLoopBackOff demo
+def crash():
+    os._exit(1)
+
+@app.get("/metrics")
+def metrics():
+    return Response(
+        f"azureshop_requests_total {REQS['total']}\n"
+        f"azureshop_errors_total {REQS['errors']}\n",
+        media_type="text/plain")
+```
+
+`app/Dockerfile`:
+```dockerfile
+FROM python:3.12-slim AS base
+WORKDIR /app
+RUN adduser --system --uid 10001 --no-create-home appuser
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY main.py .
+USER 10001
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+`app/requirements.txt`:
+```
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+azure-identity==1.18.0
+azure-keyvault-secrets==4.8.0
+azure-storage-blob==12.23.0
+redis==5.0.8
+azure-monitor-opentelemetry==1.6.1
+```
+
+### 15.4 Service, ConfigMap, SecretProviderClass, HPA, PDB, NetworkPolicy
+
+```yaml
+# k8s/base/20-service.yaml
+apiVersion: v1
+kind: Service
+metadata: { name: azureshop-api, namespace: azureshop }
+spec:
+  type: ClusterIP           # NEVER LoadBalancer per service - each one creates a billed Azure LB rule
+  selector: { app: azureshop-api }
+  ports: [{ port: 8000, targetPort: 8000, name: http }]
+---
+# k8s/base/25-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata: { name: azureshop-config, namespace: azureshop }
+data:
+  keyvault_uri:    "https://kv-azshop-REPLACE.vault.azure.net/"
+  redis_host:      "redis-azshop-REPLACE.redis.cache.windows.net"
+  storage_account: "stazshoplabREPLACE"
+---
+# k8s/base/26-secretproviderclass.yaml  (Key Vault CSI driver)
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata: { name: azureshop-kv, namespace: azureshop }
+spec:
+  provider: azure
+  parameters:
+    usePodIdentity: "false"
+    useVMManagedIdentity: "false"
+    clientID: "REPLACE_MI_CLIENT_ID"     # workload identity client id
+    keyvaultName: "kv-azshop-REPLACE"
+    tenantId: "REPLACE_TENANT_ID"
+    objects: |
+      array:
+        - |
+          objectName: sql-connection-string
+          objectType: secret
+        - |
+          objectName: redis-primary-key
+          objectType: secret
+---
+# k8s/base/30-hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: azureshop-api, namespace: azureshop }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: azureshop-api }
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 60 } }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30      # react fast
+      policies: [{ type: Percent, value: 100, periodSeconds: 30 }]
+    scaleDown:
+      stabilizationWindowSeconds: 300     # scale down slowly - avoids flapping
+      policies: [{ type: Percent, value: 50, periodSeconds: 60 }]
+---
+# k8s/base/40-pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata: { name: azureshop-api, namespace: azureshop }
+spec:
+  minAvailable: 1        # with replicas>=2 this permits drains; with replicas=1 it BLOCKS them
+  selector: { matchLabels: { app: azureshop-api } }
+---
+# k8s/base/50-networkpolicy.yaml  (enforced by Cilium dataplane)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: default-deny-ingress, namespace: azureshop }
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: { name: allow-ingress-to-api, namespace: azureshop }
+spec:
+  podSelector: { matchLabels: { app: azureshop-api } }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: app-routing-system } }
+      ports: [{ protocol: TCP, port: 8000 }]
+```
+
+### 15.5 Ingress (Day 2) and Gateway API (Day 3)
+
+```yaml
+# Day 2 - app routing add-on (managed NGINX)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: azureshop
+  namespace: azureshop
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: webapprouting.kubernetes.azure.com
+  rules:
+    - http:
+        paths:
+          - path: /api(/|$)(.*)
+            pathType: Prefix
+            backend: { service: { name: azureshop-api, port: { number: 8000 } } }
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: store-front, port: { number: 80 } } }
+```
+
+```yaml
+# Day 3 - Gateway API (the modern path). Enable with:
+#   az aks update -g $RG -n $AKS --enable-gateway-api --enable-app-routing-istio
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata: { name: azureshop-gw, namespace: azureshop }
+spec:
+  gatewayClassName: istio
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      allowedRoutes: { namespaces: { from: Same } }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata: { name: azureshop-route, namespace: azureshop }
+spec:
+  parentRefs: [{ name: azureshop-gw }]
+  rules:
+    - matches: [{ path: { type: PathPrefix, value: /api } }]
+      backendRefs: [{ name: azureshop-api, port: 8000 }]
+    - matches: [{ path: { type: PathPrefix, value: / } }]
+      backendRefs: [{ name: store-front, port: 80 }]
+```
+
+**The learning point:** Ingress crams everything into one resource plus vendor annotations. Gateway API splits it into `GatewayClass` (infra provider), `Gateway` (platform team owns the listener/TLS), and `HTTPRoute` (app team owns routing) — a role-oriented model that maps to how organisations actually divide responsibility.
+
+---
+
+## 16. Observability
+
+### 16.1 The three pillars, mapped
+
+| Pillar | Azure service | AWS analogue | Cost profile |
+|---|---|---|---|
+| **Metrics (platform)** | Azure Monitor Metrics | CloudWatch Metrics | Free |
+| **Metrics (Prometheus)** | **Azure Monitor workspace** + managed Prometheus | AMP | Per-sample ingestion — low at lab scale |
+| **Logs** | **Log Analytics workspace** + Container Insights | CloudWatch Logs | 🟠 **Per-GB — the expensive one** |
+| **Traces** | Application Insights (via OpenTelemetry) | X-Ray | Per-GB |
+| **Dashboards** | **Azure Managed Grafana** | Amazon Managed Grafana | ~$25/mo + ~$6/user; **first instance free 30 days** |
+
+> **Naming trap:** "Azure Monitor workspace" (Prometheus metrics) and "Log Analytics workspace" (logs) are two entirely different resources with confusingly similar names. Managed Grafana connects to both.
+
+### 16.2 Cost-controlled enablement
+
+**Do this before enabling Container Insights, not after:**
+
+```bash
+# 1. Hard daily cap on log ingestion - the single most important cost control
+az monitor log-analytics workspace update \
+  -g $RG -n law-azshop-lab-sea \
+  --set workspaceCapping.dailyQuotaGb=1
+
+# 2. Enable Container Insights with the cost-optimised preset
+az aks enable-addons -a monitoring -g $RG -n $AKS \
+  --workspace-resource-id $(az monitor log-analytics workspace show -g $RG -n law-azshop-lab-sea --query id -o tsv)
+
+# 3. Turn OFF stdout/stderr collection for noisy namespaces via a ConfigMap
+kubectl apply -f https://raw.githubusercontent.com/microsoft/Docker-Provider/ci_prod/kubernetes/container-azm-ms-agentconfig.yaml
+# then edit: [log_collection_settings.stdout] exclude_namespaces = ["kube-system","gatekeeper-system","app-routing-system"]
+```
+
+**What each layer costs, roughly, in this lab:**
+
+| Layer | Enable when | Est. daily |
+|---|---|---|
+| Azure Monitor platform metrics | Always (free) | $0 |
+| Log Analytics + Container Insights, 1 GB cap | Day 2 | ~$0.15 |
+| Azure Monitor workspace + managed Prometheus | Day 3 | ~$0.20 |
+| Managed Grafana | **Day 3 — burn the free 30-day window deliberately** | $0 (first 30 days) |
+| Application Insights + OTel traces | Day 3 | ~$0.10 |
+
+### 16.3 Managed Prometheus + Grafana
+
+```bash
+# Azure Monitor workspace (Prometheus metrics store)
+az monitor account create -g $RG -n amw-azshop-sea -l southeastasia
+
+# Managed Grafana - FIRST INSTANCE IS FREE FOR 30 DAYS. Only create it once.
+az grafana create -g $RG -n graf-azshop-sea -l southeastasia --sku Standard
+
+# Wire AKS -> Prometheus -> Grafana in one command
+az aks update -g $RG -n $AKS \
+  --enable-azure-monitor-metrics \
+  --azure-monitor-workspace-resource-id $(az monitor account show -g $RG -n amw-azshop-sea --query id -o tsv) \
+  --grafana-resource-id $(az grafana show -g $RG -n graf-azshop-sea --query id -o tsv)
+```
+
+This auto-deploys the `ama-metrics` pods, creates recording rules, and provisions the standard Kubernetes dashboards in Grafana. You get node/pod/cluster dashboards for free — build only what's missing.
+
+### 16.4 OpenTelemetry → Application Insights
+
+Since you already know OTel, this is the smallest possible delta:
+
+```python
+# add to app/main.py, before creating the FastAPI app
+from azure.monitor.opentelemetry import configure_azure_monitor
+configure_azure_monitor(connection_string=os.getenv("APPLICATIONINSIGHTS_CONNECTION_STRING"))
+```
+
+That single call wires traces, metrics, and logs to Application Insights over OTLP. **Difference from your Loki/Tempo stack:** Azure's backend is unified — traces, logs, and metrics land in the same workspace and correlate via `operation_Id` automatically, so the Application Map builds itself. You don't run collectors.
+
+### 16.5 Dashboards to build
+
+| Dashboard | Key panels | Data source |
+|---|---|---|
+| **Cluster health** | Node ready count, node CPU/mem %, allocatable vs requested, pod count per node | Prometheus |
+| **Workload health** | Pod restarts (`kube_pod_container_status_restarts_total`), replicas desired vs ready, OOMKilled count, pending pods | Prometheus |
+| **Golden signals** | Request rate, error rate (5xx %), p50/p95/p99 latency, saturation (CPU %) | Prometheus + App Insights |
+| **Data tier** | SQL DTU/vCore %, SQL connection failures, SQL storage %, Redis hit ratio, Redis evicted keys, Redis server load | Azure Monitor |
+| **Edge** | Front Door request count, origin health probe status, WAF blocked requests by rule, cache hit ratio | Azure Monitor |
+
+Two KQL queries worth memorising:
+
+```kusto
+// Pod restarts in the last hour, worst first
+KubePodInventory
+| where TimeGenerated > ago(1h)
+| where ContainerRestartCount > 0
+| summarize Restarts = max(ContainerRestartCount) by Name, Namespace
+| order by Restarts desc
+```
+
+```kusto
+// 5xx rate by route, 5-minute buckets
+AppRequests
+| where TimeGenerated > ago(1h)
+| summarize
+    total = count(),
+    errors = countif(toint(ResultCode) >= 500)
+  by bin(TimeGenerated, 5m), Name
+| extend error_rate_pct = round(100.0 * errors / total, 2)
+| order by TimeGenerated desc
+```
+
+### 16.6 Alerts
+
+| Alert | Condition | Severity | Why this threshold |
+|---|---|---|---|
+| Node not ready | `kube_node_status_condition{condition="Ready",status="true"} == 0` for 5m | Sev1 | 5m avoids alerting on normal reboots |
+| Pod crash loop | `rate(kube_pod_container_status_restarts_total[15m]) > 0` for 10m | Sev2 | Rate, not count — a single restart is noise |
+| High memory | container memory / limit > 90% for 10m | Sev2 | OOMKill is imminent |
+| API 5xx | error rate > 5% for 5m | Sev1 | Tie to your SLO, not a round number |
+| High latency | p95 > 1s for 10m | Sev2 | |
+| HPA at max | `kube_hpa_status_current_replicas == kube_hpa_spec_max_replicas` for 15m | Sev3 | You're capped and can't absorb more |
+| SQL failure | `connection_failed > 0` | Sev1 | |
+| SQL near free limit | free vCore-seconds remaining < 10% | Sev2 | **Lab-specific — stops the DB auto-pausing on you mid-demo** |
+| Redis high load | server load > 80% for 10m | Sev2 | |
+| Front Door origin unhealthy | any origin health < 100% for 3m | Sev1 | This is your DR trigger |
+| **Budget alert** | spend > $50 / $100 / $150 | Sev1 | **Set this first, before anything else** |
+
+```bash
+# Action group = SNS topic equivalent
+az monitor action-group create -g $RG -n ag-azshop-email \
+  --short-name azshop \
+  --action email me your.email@example.com
+```
+
+---
+
+## 17. Security Hardening
+
+### 17.1 Checklist
+
+**Identity**
+- [ ] No client secrets in GitHub — federated OIDC credentials only
+- [ ] Federated credential subject scoped to a specific branch or GitHub Environment, not a wildcard
+- [ ] User-assigned managed identities for all workloads
+- [ ] Workload Identity enabled; every app pod has the `azure.workload.identity/use: "true"` label
+- [ ] RBAC scoped to the **resource group**, never the subscription
+- [ ] `az ad sp list --all --query "[?passwordCredentials]"` returns nothing you own
+- [ ] AKS uses **Entra ID integration + Azure RBAC for Kubernetes authorization** (`--enable-aad --enable-azure-rbac`), not local admin accounts
+- [ ] AKS local accounts disabled (`--disable-local-accounts`)
+
+**Network**
+- [ ] API server access restricted (authorized IP ranges in lab; private cluster in production)
+- [ ] Zero public IPs on nodes
+- [ ] Private Endpoints for SQL, Redis, Storage, Key Vault, ACR
+- [ ] Public network access **disabled** on each of those resources after the PE works
+- [ ] Private DNS zones linked to the VNet, resolution verified from inside a pod
+- [ ] NSGs on every subnet; `snet-appgw` has the `GatewayManager` 65200-65535 rule
+- [ ] Explicit egress via NAT Gateway (`--outbound-type userAssignedNATGateway`)
+- [ ] NetworkPolicy default-deny in the app namespace, enforced by Cilium
+- [ ] App Gateway/origin locked to `AzureFrontDoor.Backend` service tag + `X-Azure-FDID` header
+
+**Data & secrets**
+- [ ] Key Vault RBAC authorisation model (not access policies)
+- [ ] Soft-delete on; **purge protection OFF in lab** (it blocks rebuilds), ON in production
+- [ ] SQL: Entra-only authentication where possible, TLS enforced, no `0.0.0.0` firewall rule
+- [ ] Storage: `allowBlobPublicAccess=false`, `minimumTlsVersion=TLS1_2`, shared key access disabled
+- [ ] ACR admin user **disabled**; pulls via kubelet identity `AcrPull`
+- [ ] Terraform state storage: public access disabled, RBAC auth, versioning on
+
+**Containers**
+- [ ] Non-root, `readOnlyRootFilesystem: true`, all capabilities dropped
+- [ ] Trivy blocks HIGH/CRITICAL in CI
+- [ ] Immutable image tags; `:latest` never referenced
+- [ ] Pod Security Admission labels on the namespace
+
+**Platform**
+- [ ] Azure Policy assigned (see below)
+- [ ] Defender for Cloud **free foundational CSPM** enabled; paid plans off
+- [ ] Diagnostic settings shipping AKS control-plane logs (`kube-audit-admin`, `kube-apiserver`) to Log Analytics
+- [ ] Budget alerts configured
+
+### 17.2 Azure Policy — free and genuinely useful
+
+Azure Policy is more capable than SCPs because it can **remediate**, not just deny. Assign these built-ins (all free):
+
+```bash
+SCOPE=$(az group show -n $RG --query id -o tsv)
+
+# Deny public IPs on VMs
+az policy assignment create --name "deny-public-ip" --scope "$SCOPE" \
+  --policy "83a86a26-fd1f-447c-b59d-e51f44264114"
+
+# Audit AKS clusters without RBAC
+az policy assignment create --name "audit-aks-rbac" --scope "$SCOPE" \
+  --policy "ac4a19c2-fa67-49b4-8ae5-0b2e78c49457"
+
+# The big one: the Kubernetes cluster pod security baseline initiative (Gatekeeper-based)
+az aks enable-addons -a azure-policy -g $RG -n $AKS
+```
+
+Check compliance:
+```bash
+az policy state summarize --resource-group $RG -o table
+```
+
+### 17.3 Where money hides in "security"
+
+| Feature | Free? | Lab recommendation |
+|---|---|---|
+| Defender for Cloud foundational CSPM | ✅ Free | Enable |
+| Defender for Containers | ❌ Per-vCore/month | **Skip.** Use Trivy in CI |
+| Defender for SQL | ❌ Per-server/month | Skip |
+| Defender CSPM (advanced) | ❌ Per-resource | Skip |
+| Azure Policy | ✅ Free | Enable |
+| NSGs, Private Endpoints* | ✅ / *~$0.01/hr | Use |
+| Key Vault | ✅ Effectively free | Use |
+| DDoS Protection Standard | ❌ **~$2,900/month** | **Never.** Front Door has DDoS protection built in at no extra fee |
+| WAF (Front Door Standard, custom rules) | Included in the $35/mo base | Use for the lab |
+| WAF (managed rulesets) | Requires Front Door Premium ($330/mo) or App Gateway WAF_v2 hourly | One session only |
+
+---
+
+## 18. Disaster Recovery
+
+### 18.1 Normal state vs DR state
+
+**Normal (Days 1–4):** Region 1 only. `envs/lab` applied. Region 2 doesn't exist.
+
+**DR exercise (Day 5, ~3 hours, ~$25):** `envs/dr` applied in `eastasia`, Front Door origin group holds both, run the failover, measure, destroy.
+
+### 18.2 How failover actually works
+
+Front Door origin groups use **priority** (and weight within a priority). Origins in priority 1 receive all traffic while healthy. Front Door probes each origin on a configured path and interval; when an origin fails the probe threshold, Front Door stops routing to it and promotes priority 2.
+
+```
+Health probe path:      /healthz
+Probe interval:         30s  (tune to 15s for a faster demo)
+Sample size:            4
+Successful samples req: 2
+→ Detection time ≈ 30-90 seconds
+```
+
+**This is faster and more reliable than DNS failover** because there's no client-side or resolver-side TTL caching involved — the anycast edge simply routes elsewhere. Compare: Route 53 failover records depend on TTL respect by every resolver in the chain.
+
+### 18.3 Data replication — and the honest free-tier caveat
+
+| Layer | Production approach | Lab approach (free offer) | RPO |
+|---|---|---|---|
+| **Azure SQL** | **Failover Group** — managed listener endpoint, auto-failover, async replication | ❌ Failover groups are **not available on the free offer**. Use **geo-restore from geo-redundant backup**, or pay for one General Purpose DB for 3 hours (~$0.60) to demo a real failover group | Failover group: seconds–minutes. Geo-restore: **up to 1 hour** |
+| **Redis** | Premium geo-replication | ❌ Not on Basic. **Accept a cold cache in DR** | N/A — a cache is not a source of truth |
+| **Blob Storage** | RA-GRS + customer-managed failover | RA-GRS (read-only secondary until failover) | ~15 min |
+| **ACR** | Premium geo-replication | Premium for 1 hour on Day 5 | Near-zero |
+| **Secrets** | Separate vault per region, same secret names | Same | Manual sync |
+
+**This caveat is a feature, not a bug, for your interview.** Being able to say *"our lab used geo-restore with a 1-hour RPO because failover groups weren't available on the tier; in production I'd use a failover group to get that to seconds, and here's the cost difference"* demonstrates exactly the judgement being tested.
+
+### 18.4 Failure scenarios matrix
+
+| # | Failure | What breaks | What detects it | Auto-recovers? | Manual action | RTO | RPO | Test method |
+|---|---|---|---|---|---|---|---|---|
+| 1 | **Pod failure** | 1/N replicas | kubelet + Deployment controller | ✅ Yes | None | <10s | 0 | `kubectl delete pod` |
+| 2 | **Node failure** | Pods on that node | Node controller (`node-monitor-grace-period` ~40s) | ✅ Reschedule; VMSS replaces node | None | 1–5 min | 0 | Deallocate the VMSS instance |
+| 3 | **Node pool failure** | All pods on that pool | Cluster Autoscaler + scheduler | ⚠️ Only if another pool has capacity | Scale the other pool | 5–10 min | 0 | `az aks nodepool scale --node-count 0` |
+| 4 | **AZ failure** | ~1/3 of nodes | Azure platform + node controller | ✅ If zone-redundant with spare capacity | None | 2–10 min | 0 | Cordon+drain all nodes in one zone |
+| 5 | **App bug / bad deploy** | Everything | Readiness probes, 5xx alert | ⚠️ Rolling update halts on failed readiness | `kubectl rollout undo` | 2–5 min | 0 | Deploy a broken image tag |
+| 6 | **Database failure** | All writes | Connection failure alert, readiness | ❌ No | Geo-restore or failover group failover | 5 min (FG) → 1 hr (geo-restore) | Seconds (FG) → ~1 hr (geo-restore) | Delete the private endpoint / firewall the DB |
+| 7 | **Redis failure** | Latency spike, cache misses | Redis metrics, latency alert | ⚠️ **Only if the app degrades gracefully** | Recreate cache | <1 min if graceful | 0 (cache is not truth) | Delete the Redis private endpoint |
+| 8 | **ACR failure** | New pods can't pull; **running pods unaffected** | `ImagePullBackOff` events | ✅ With Premium geo-replication | Failover registry | 0 for running pods | 0 | Remove the `AcrPull` role assignment |
+| 9 | **Region 1 total failure** | Everything in SEA | Front Door health probe | ✅ Front Door promotes priority 2 | Promote SQL secondary | **1–3 min** (traffic) | Depends on SQL strategy | Scale AKS to 0 nodes / stop the App Gateway |
+| 10 | **Region 2 recovery** | — | Health probe recovers | ✅ Front Door fails back to priority 1 | Re-establish SQL replication in the right direction | 1–3 min | — | Restore Region 1 |
+
+### 18.5 Running the Day 5 DR exercise
+
+```bash
+# ---------- SETUP (~40 min) ----------
+cd envs/dr
+terraform init && terraform apply -auto-approve      # ⚠️ ~$12/day while it exists
+
+# Deploy the same workloads (identical manifests - that's the point of ACR geo-replication)
+az aks get-credentials -g rg-azshop-dr-eas -n aks-azshop-dr-eas --overwrite-existing
+kubectl apply -k k8s/overlays/dr
+
+# Add region 2 as priority-2 origin
+az afd origin create \
+  --resource-group rg-azshop-lab-sea \
+  --profile-name fd-azshop \
+  --origin-group-name og-azureshop \
+  --origin-name origin-eas \
+  --host-name <dr-ingress-fqdn> \
+  --priority 2 --weight 1000 --enabled-state Enabled \
+  --http-port 80 --https-port 443
+
+# ---------- BASELINE ----------
+# Start a continuous probe in a second terminal and LEAVE IT RUNNING
+while true; do
+  printf '%s  ' "$(date -u +%H:%M:%S)"
+  curl -s -o /dev/null -w "%{http_code} %{time_total}s\n" \
+    --max-time 5 https://<frontdoor-endpoint>/api/healthz || echo "FAILED"
+  sleep 1
+done | tee dr-timeline.log            # ← THIS FILE IS YOUR EVIDENCE
+
+# ---------- INDUCE FAILURE ----------
+date -u +%H:%M:%S > failure-start.txt
+az aks nodepool scale -g rg-azshop-lab-sea --cluster-name aks-azshop-lab-sea -n user --node-count 0
+az aks nodepool scale -g rg-azshop-lab-sea --cluster-name aks-azshop-lab-sea -n system --node-count 0
+
+# ---------- OBSERVE ----------
+# Watch dr-timeline.log. You will see:
+#   1. 200s from SEA
+#   2. A window of 502/503/timeouts  <- THIS DURATION IS YOUR RTO
+#   3. 200s again, now served from EAS
+# Confirm the region serving you:
+curl -sI https://<frontdoor-endpoint>/api/healthz | grep -i x-azure-ref
+
+# ---------- MEASURE ----------
+# RTO = timestamp of first 200-after-failure  minus  timestamp of last 200-before-failure
+# RPO = rows written to SEA SQL that are absent from the EAS restore
+
+# ---------- FAIL BACK ----------
+az aks nodepool scale -g rg-azshop-lab-sea --cluster-name aks-azshop-lab-sea -n system --node-count 1
+az aks nodepool scale -g rg-azshop-lab-sea --cluster-name aks-azshop-lab-sea -n user --node-count 1
+# Front Door returns to priority 1 automatically once probes pass
+
+# ---------- DESTROY IMMEDIATELY ----------
+kubectl delete svc --all -A --context=<dr-context>   # release Azure LBs FIRST
+cd envs/dr && terraform destroy -auto-approve
+az group delete -n rg-azshop-dr-eas --yes --no-wait
+```
+
+**Record these numbers — they go in your README:**
+```
+Detection time:     ____ s   (probe interval x samples required)
+Traffic RTO:        ____ s   (first 5xx -> first 200 from EAS)
+Data RPO:           ____     (geo-restore: up to 1 hour)
+Failback RTO:       ____ s
+Requests lost:      ____ / ____ total
+```
+
+---
+
+## 19. Failure Engineering Lab
+
+Run these on Day 4. Every one is cheap; most are free.
+
+### Experiment 1 — Pod deletion
+
+| | |
+|---|---|
+| **Objective** | Prove the Deployment controller's reconciliation loop and that a PDB doesn't block involuntary disruption |
+| **Command** | `kubectl -n azureshop delete pod -l app=azureshop-api --wait=false` |
+| **Expected** | New pods appear within ~1s; `ContainerCreating` → `Running` in <10s |
+| **Observe** | `kubectl get pods -n azureshop -w` — and in Grafana, the request rate should not dip if `maxUnavailable: 0` and replicas ≥ 2 |
+| **Diagnose** | `kubectl get events -n azureshop --sort-by=.lastTimestamp` |
+| **Recover** | Automatic |
+| **Cost** | $0 |
+| **Concept** | Desired-state reconciliation; PDBs govern *voluntary* disruption only |
+
+### Experiment 2 — Node failure
+
+| | |
+|---|---|
+| **Objective** | Observe node NotReady detection, pod eviction, and VMSS self-healing |
+| **Command** | ```MC=$(az aks show -g $RG -n $AKS --query nodeResourceGroup -o tsv)```<br>```VMSS=$(az vmss list -g $MC --query "[0].name" -o tsv)```<br>```az vmss deallocate -g $MC -n $VMSS --instance-ids 0``` |
+| **Expected** | Node → `NotReady` after ~40s; pods evicted after the 5-min toleration; rescheduled elsewhere |
+| **Observe** | `kubectl get nodes -w`; `kubectl describe node <n>` shows the `NotReady` condition transition |
+| **Diagnose** | `kubectl get pods -o wide -w` |
+| **Recover** | `az vmss start -g $MC -n $VMSS --instance-ids 0` |
+| **Cost** | $0 (deallocated VMs don't bill compute) |
+| **Concept** | `node-monitor-grace-period` (~40s) vs `tolerationSeconds` (300s default) — total eviction delay is ~5m40s. **This surprises people who expect instant rescheduling.** |
+
+### Experiment 3 — Zone failure simulation
+
+| | |
+|---|---|
+| **Objective** | Prove topology spread constraints and zone-redundant scheduling |
+| **Setup** | `az aks nodepool scale -g $RG --cluster-name $AKS -n user --node-count 3` (⚠️ +$0.17/hr) |
+| **Command** | ```for n in $(kubectl get nodes -l topology.kubernetes.io/zone=southeastasia-1 -o name); do kubectl cordon $n && kubectl drain $n --ignore-daemonsets --delete-emptydir-data --force; done``` |
+| **Expected** | Pods reschedule into zones 2 and 3; `topologySpreadConstraints` with `ScheduleAnyway` allows imbalance rather than blocking |
+| **Observe** | `kubectl get pods -o wide -L topology.kubernetes.io/zone` |
+| **Recover** | `kubectl uncordon <nodes>` |
+| **Cost** | ~$0.50 for a 3-hour session — **scale back to 1 immediately after** |
+| **Concept** | Azure subnets are regional, so zone spread is a *node pool* property, not a subnet property |
+
+### Experiment 4 — CrashLoopBackOff
+
+| | |
+|---|---|
+| **Objective** | Understand exponential backoff and how to debug a crashing container |
+| **Command** | `kubectl -n azureshop exec deploy/azureshop-api -- curl -s localhost:8000/crash` |
+| **Expected** | Restart, then `CrashLoopBackOff` with backoff doubling: 10s, 20s, 40s, 80s, 160s, capped at 300s |
+| **Diagnose** | ```kubectl logs -n azureshop <pod> --previous```  ← **`--previous` is the key flag; without it you see the new container's empty log**<br>```kubectl describe pod <pod> \| grep -A5 "Last State"``` |
+| **Recover** | Automatic once the endpoint stops being called |
+| **Cost** | $0 |
+| **Concept** | `--previous`; exponential backoff; why liveness probes must be cheap |
+
+### Experiment 5 — Trigger the HPA and Cluster Autoscaler
+
+| | |
+|---|---|
+| **Objective** | See the full scaling chain: load → HPA → pending pods → Cluster Autoscaler → new node |
+| **Command** | ```kubectl -n azureshop run load --rm -it --image=williamyeh/hey --restart=Never -- \```<br>```  -z 5m -c 50 http://azureshop-api:8000/burn?seconds=5``` |
+| **Expected** | CPU > 60% → HPA scales 2→6 → pods go `Pending` (node full) → Cluster Autoscaler adds a node in ~3 min → pods schedule |
+| **Observe** | ```watch kubectl get hpa,pods,nodes -n azureshop```<br>```kubectl -n kube-system logs -l app=cluster-autoscaler --tail=50``` |
+| **Recover** | Stop the load; HPA scales down after the 300s stabilisation window; CA removes nodes after ~10 min |
+| **Cost** | ~$0.20 for the extra node-hour |
+| **Concept** | **Autoscaling requires resource requests.** No requests = no scale-out. Also: scale-down is deliberately much slower than scale-up. |
+
+### Experiment 6 — Break ingress
+
+| | |
+|---|---|
+| **Objective** | Distinguish an ingress-controller failure from a backend failure |
+| **Command** | `kubectl -n azureshop patch svc azureshop-api -p '{"spec":{"selector":{"app":"wrong-label"}}}'` |
+| **Expected** | 503 from the ingress. Pods are healthy — the Service just has zero endpoints |
+| **Diagnose** | ```kubectl get endpoints -n azureshop azureshop-api```  ← **`<none>` is the smoking gun**<br>```kubectl -n app-routing-system logs -l app=nginx --tail=50``` |
+| **Recover** | `kubectl -n azureshop patch svc azureshop-api -p '{"spec":{"selector":{"app":"azureshop-api"}}}'` |
+| **Cost** | $0 |
+| **Concept** | Service → endpoints → pods. Empty endpoints means a selector mismatch or all pods failing readiness. |
+
+### Experiment 7 — Break DNS
+
+| | |
+|---|---|
+| **Objective** | Understand CoreDNS's blast radius |
+| **Command** | `kubectl -n kube-system scale deploy coredns --replicas=0` |
+| **Expected** | Every service-name lookup fails. Existing TCP connections survive; new ones fail. Readiness probes using hostnames go red |
+| **Diagnose** | ```kubectl run dnstest --rm -it --image=nicolaka/netshoot --restart=Never -- nslookup kubernetes.default``` |
+| **Recover** | `kubectl -n kube-system scale deploy coredns --replicas=2` |
+| **Cost** | $0 |
+| **Concept** | DNS is a hard dependency for almost everything. This is why CoreDNS runs on the system pool with a PDB. |
+
+### Experiment 8 — Break Workload Identity (⭐ the most Azure-specific one)
+
+| | |
+|---|---|
+| **Objective** | Learn the four-part chain by breaking each part |
+| **Command A** | Remove the pod label: `kubectl -n azureshop patch deploy azureshop-api --type=json -p='[{"op":"remove","path":"/spec/template/metadata/labels/azure.workload.identity~1use"}]'` |
+| **Expected A** | No `AZURE_*` env vars injected; `/secret` fails with a credential-chain error |
+| **Command B** | Delete the federated credential: `az identity federated-credential delete --name fc-azureshop-api --identity-name id-azureshop-workload -g $RG --yes` |
+| **Expected B** | `AADSTS70021: No matching federated identity record found` |
+| **Command C** | Remove the RBAC role: `az role assignment delete --assignee <mi-principal-id> --role "Key Vault Secrets User" --scope <kv-id>` |
+| **Expected C** | Token issued fine, but Key Vault returns **403 Forbidden** — authentication succeeded, authorisation failed |
+| **Diagnose** | ```kubectl exec -n azureshop deploy/azureshop-api -- env \| grep AZURE_```<br>```kubectl logs -n azureshop deploy/azureshop-api \| grep -i AADSTS``` |
+| **Recover** | Reverse each change |
+| **Cost** | $0 |
+| **Concept** | **Three distinct failure signatures:** no token injected (missing label) ≠ token rejected (missing federated credential) ≠ 403 (missing RBAC). Being able to tell these apart instantly is a senior-level skill. |
+
+### Experiment 9 — Break ACR authentication
+
+| | |
+|---|---|
+| **Objective** | Distinguish `ImagePullBackOff` causes |
+| **Command** | ```KUBELET=$(az aks show -g $RG -n $AKS --query identityProfile.kubeletidentity.objectId -o tsv)```<br>```az role assignment delete --assignee $KUBELET --role AcrPull --scope $(az acr show -n $ACR --query id -o tsv)```<br>then `kubectl -n azureshop rollout restart deploy/azureshop-api` |
+| **Expected** | New pods `ImagePullBackOff`. **Running pods keep running** — this is important |
+| **Diagnose** | `kubectl describe pod <pod> \| grep -A5 Events` → `401 Unauthorized` (auth) vs `manifest unknown` (wrong tag) vs `no such host` (DNS/private endpoint) |
+| **Recover** | `az aks update -g $RG -n $AKS --attach-acr $ACR` |
+| **Cost** | $0 |
+| **Concept** | Registry outages degrade *deployments*, not *running workloads*. Argues for image pre-pulling and multi-region registries. |
+
+### Experiment 10 — Break the private endpoint (simulate DB outage)
+
+| | |
+|---|---|
+| **Objective** | See how private-link failure differs from a database failure |
+| **Command** | `az network private-endpoint delete -g $RG -n pe-sql-azshop` |
+| **Expected** | DNS still resolves (the zone record lingers briefly) but connections time out. Readiness probes fail → pods removed from endpoints → ingress returns 503 |
+| **Diagnose** | ```kubectl run nc --rm -it --image=nicolaka/netshoot --restart=Never -- nc -zv sql-azshop-xxx.database.windows.net 1433```<br>```kubectl run dns --rm -it --image=nicolaka/netshoot --restart=Never -- nslookup sql-azshop-xxx.database.windows.net``` |
+| **Recover** | `terraform apply` (recreates the PE and DNS record) |
+| **Cost** | $0 |
+| **Concept** | **A timeout means network; a 401/403 means identity; a refused connection means firewall.** Learn to read the failure mode. |
+
+### Experiment 11 — Regional outage
+
+Covered in §18.5. The single most valuable exercise in this document.
+
+---
+
+## 20. The 5-Day Schedule
+
+**Budget target: ~$60–80 of your $200.** Track daily against §23.
+
+| Day | Theme | Est. cost | Cumulative |
+|---|---|---|---|
+| **Day 0** | Pre-flight (30 min, do this the night before) | $0 | $0 |
+| **Day 1** | Foundation: CLI, RG, budget, Terraform, network | ~$1.50 | ~$1.50 |
+| **Day 2** | Identity, ACR, AKS, data tier, app running | ~$6 | ~$8 |
+| **Day 3** | CI/CD + observability + Gateway API | ~$8 | ~$16 |
+| **Day 4** | Edge (App Gateway + WAF + Front Door), scaling, chaos | ~$25 | ~$41 |
+| **Day 5** | Multi-region DR, evidence, **total teardown** | ~$25 | ~$66 |
+
+---
+
+### DAY 0 — Pre-flight (30 minutes, night before) `[CORE]`
+
+**Objective:** Remove every blocker so Day 1 is pure building.
+
+| Task | Command / action |
+|---|---|
+| Create Azure account | https://azure.microsoft.com/free |
+| Install tools | See §21.1 |
+| **Check vCPU quota** ⚠️ | `az vm list-usage -l southeastasia -o table \| grep -i "Total Regional"` |
+| Decide on upgrading | If quota limit is 4 vCPU and you can't raise it, upgrade to pay-as-you-go **now** (credits stay usable to the original expiry) |
+| Register resource providers | See §21.2 — takes ~5 min, do it before bed |
+| Fork/clone the sample app | `git clone https://github.com/Azure-Samples/aks-store-demo` |
+| Create your GitHub repo | `azureshop` (public — it's your portfolio) |
+| Note your public IP | `curl -s ifconfig.me` — needed for API server authorized ranges |
+
+**Definition of done:** `az account show` works, `az vm list-usage` shows your quota, providers registered.
+
+---
+
+### DAY 1 — Foundation and Network `[3–4 hrs]`
+
+**Cost impact:** ~$1.50/day ongoing (NAT Gateway ~$1.08 + public IP). **Leave running.**
+
+| Block | What to learn | What to build | Definition of done |
+|---|---|---|---|
+| 1 (45m) | Subscriptions, RGs, naming, tags, budgets | RG + tags + budget alerts at $50/$100/$150 | Budget visible in Cost Management; email alert configured |
+| 2 (45m) | `azurerm` backend, blob lease locking | `bootstrap/` → state storage account; `envs/lab/backend.tf` | `terraform init` succeeds against the remote backend |
+| 3 (90m) | VNet, regional subnets, NSGs, service tags, NAT Gateway | `modules/network` fully applied | `az network vnet subnet list` shows 4 subnets; NAT GW attached |
+| 4 (30m) | Private DNS zones and VNet links | 5 private DNS zones + links | `az network private-dns link vnet list` shows 5 links |
+| 5 (30m) | Verify + **practise the destroy/rebuild loop** | `terraform destroy` then `terraform apply` | Full rebuild completes in <5 min |
+
+**Full commands in §21.**
+
+**Verification:**
+```bash
+az network vnet show -g rg-azshop-lab-sea -n vnet-azshop-lab-sea --query "{name:name,cidr:addressSpace.addressPrefixes}" -o json
+az network vnet subnet list -g rg-azshop-lab-sea --vnet-name vnet-azshop-lab-sea -o table
+az network nat gateway list -g rg-azshop-lab-sea -o table
+az network private-dns zone list -g rg-azshop-lab-sea -o table
+```
+
+**⚠️ Cost warning:** NAT Gateway starts billing the moment it's created, even before it's attached to a subnet.
+
+---
+
+### DAY 2 — Identity, Registry, AKS, Data `[4 hrs]`
+
+**Cost impact:** ~$6/day. **Leave running.** This is the biggest single day of learning.
+
+| Block | Learn | Build | Definition of done |
+|---|---|---|---|
+| 1 (20m) | Redis provisioning latency | **Start Redis FIRST** — it takes 15–25 min | Kicked off in background |
+| 2 (40m) | Entra ID vs Azure RBAC vs data-plane RBAC | User-assigned MI + scoped role assignments | `az role assignment list --assignee <mi>` shows exactly the roles you intended |
+| 3 (30m) | Key Vault RBAC model, soft-delete | Key Vault + private endpoint + a `demo-secret` | `az keyvault secret show` works for you, fails for an unassigned principal |
+| 4 (30m) | ACR, kubelet identity `AcrPull` | ACR Basic + PE + `--attach-acr` | `az acr repository list` works; admin user disabled |
+| 5 (75m) | **Azure CNI Overlay, Cilium, node pools, taints** | AKS cluster | `kubectl get nodes` returns nodes; system pool tainted |
+| 6 (30m) | Azure SQL free offer, private endpoints | SQL DB (free offer) + Storage + all 5 PEs | `nslookup` from a pod returns `10.20.5.x` for every service |
+| 7 (45m) | Workload Identity end-to-end | Federated credential + SA + labelled pod | `curl localhost:8000/secret` returns a Key Vault secret |
+| 8 (30m) | Ingress | App routing add-on + `aks-store-demo` | Store front reachable in a browser |
+
+**⚠️ Cost warnings:** Redis Basic C0 bills 24/7 from creation (~$0.53/day). Each node bills ~$2/day. **Do not create more than 2 nodes today.**
+
+**Verification — the four things that must be true:**
+```bash
+# 1. Cluster reachable, nodes ready
+kubectl get nodes -o wide
+
+# 2. Private DNS resolving correctly (THE critical check)
+kubectl run netcheck --rm -it --image=nicolaka/netshoot --restart=Never -- \
+  sh -c 'nslookup sql-azshop-XXXX.database.windows.net; nslookup kv-azshop-XXXX.vault.azure.net'
+# BOTH must return 10.20.5.x
+
+# 3. Workload identity token present
+kubectl exec -n azureshop deploy/azureshop-api -- env | grep AZURE_FEDERATED_TOKEN_FILE
+
+# 4. App running
+kubectl get pods -n pets
+curl http://$(kubectl get svc -n app-routing-system nginx -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+```
+
+---
+
+### DAY 3 — CI/CD and Observability `[4 hrs]`
+
+**Cost impact:** ~$8/day (Grafana is free for 30 days — **today is when you spend that window**).
+
+| Block | Learn | Build | Definition of done |
+|---|---|---|---|
+| 1 (60m) | GitHub OIDC federation | App registration + 2 federated credentials + RBAC | A workflow runs `az account show` with zero stored secrets |
+| 2 (60m) | Pipeline design, Trivy gating | `infra.yml` + `app.yml` | A PR posts a plan comment; merge to main deploys |
+| 3 (30m) | Log Analytics, daily caps, KQL | Workspace + 1 GB cap + Container Insights | KQL query returns pod restart counts |
+| 4 (45m) | Managed Prometheus + Grafana | Azure Monitor workspace + Grafana + AKS wiring | Grafana shows the built-in K8s dashboards with live data |
+| 5 (30m) | OTel → App Insights | `configure_azure_monitor()` in the app | A trace appears in Application Insights end-to-end |
+| 6 (30m) | Alerts + action groups | 5 alert rules + email action group | You receive a test alert email |
+| 7 (30m) `[STRETCH]` | Gateway API | `--enable-gateway-api --enable-app-routing-istio` + Gateway/HTTPRoute | Traffic flows via `HTTPRoute` |
+
+**⚠️ Cost warning:** Managed Grafana's free window is **30 days from creation of the first instance in the subscription**. Create it exactly once, today. Container Insights without a daily cap can generate GBs — set the cap before enabling.
+
+---
+
+### DAY 4 — Edge, Scaling, Chaos `[4–5 hrs]` ⚠️ EXPENSIVE DAY
+
+**Cost impact:** ~$25 if you follow the timers. **Set a phone alarm before you start.**
+
+| Block | Learn | Build | Destroy after? |
+|---|---|---|---|
+| 1 (90m) ⚠️ | App Gateway WAF_v2, AGIC, `GatewayManager` NSG rule | `terraform apply -var="mode=production"` | ✅ **YES — within 3 hours** (~$1.60) |
+| 2 (30m) | WAF managed rules | Fire a SQLi probe, watch it get blocked, read the WAF log | With block 1 |
+| 3 (60m) | Front Door origin groups, health probes | Front Door **Standard** + custom WAF rule + origin locked to `AzureFrontDoor.Backend` | ⚠️ Keep until Day 5 (needed for DR) |
+| 4 (45m) | HPA + Cluster Autoscaler chain | Experiment 5 | Scale nodes back to 1 |
+| 5 (60m) | Failure modes | Experiments 1, 2, 4, 6, 7, 8, 9, 10 | $0 |
+| 6 (20m) | Zone spread `[STRETCH]` | Experiment 3 | Scale back to 1 |
+
+**The SQLi WAF test:**
+```bash
+# Should return 403 with a WAF block
+curl -i "https://<frontdoor-endpoint>/api/db?id=1%27%20OR%20%271%27=%271"
+
+# Then read the log
+az monitor log-analytics query \
+  --workspace $(az monitor log-analytics workspace show -g $RG -n law-azshop-lab-sea --query customerId -o tsv) \
+  --analytics-query "AzureDiagnostics | where Category == 'FrontdoorWebApplicationFirewallLog' | project TimeGenerated, action_s, ruleName_s, clientIP_s | take 20" -o table
+```
+
+**⚠️⚠️ MANDATORY end-of-day step:**
+```bash
+cd envs/lab && terraform apply -var="mode=lab" -auto-approve   # destroys App Gateway
+az network application-gateway list -o table                    # MUST return []
+```
+
+---
+
+### DAY 5 — Multi-region DR, Evidence, Teardown `[4–5 hrs]` ⚠️ EXPENSIVE DAY
+
+**Cost impact:** ~$25. **Everything gets destroyed today.**
+
+| Block | Activity | Time |
+|---|---|---|
+| 1 ⚠️ | `cd envs/dr && terraform apply` — second region | 45m |
+| 2 | Deploy identical workloads (proves ACR geo-replication + portable manifests) | 20m |
+| 3 | Add region 2 as a priority-2 Front Door origin | 15m |
+| 4 | **Run the DR exercise (§18.5)** — the centrepiece | 60m |
+| 5 | Fail back, measure, record RTO/RPO | 20m |
+| 6 | **Capture all evidence** (§26.2) — screenshots, logs, outputs | 45m |
+| 7 | **Total teardown (§24)** and verify $0 burn rate | 45m |
+
+**Definition of done:** `az group list -o table` returns nothing but (optionally) your state RG. `dr-timeline.log` contains a measured RTO. Your GitHub repo has the README with real numbers.
+
+---
+
+## 21. Day 0 & Day 1 — Exact Steps
+
+### 21.1 Install tooling (macOS / Linux)
+
+```bash
+# ---- macOS ----
+brew update
+brew install azure-cli terraform kubectl helm kubelogin jq
+brew install --cask docker
+
+# ---- Ubuntu / Debian ----
+curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+wget -O- https://apt.releases.hashicorp.com/gpg | gpg --dearmor | \
+  sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+  https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
+  sudo tee /etc/apt/sources.list.d/hashicorp.list
+sudo apt update && sudo apt install terraform
+
+sudo az aks install-cli          # installs kubectl AND kubelogin
+sudo snap install helm --classic
+sudo apt install -y jq
+
+# ---- Verify ----
+az version
+terraform version
+kubectl version --client
+helm version
+docker --version
+```
+
+### 21.2 Login, subscription discovery, provider registration
+
+```bash
+az login                                    # add --use-device-code if no browser
+
+# List subscriptions
+az account list --output table
+
+# Set the working subscription
+export SUB_ID=$(az account list --query "[?isDefault].id" -o tsv)
+az account set --subscription "$SUB_ID"
+echo "Subscription: $SUB_ID"
+
+# Confirm identity and tenant
+az account show --query "{sub:name, subId:id, tenant:tenantId, user:user.name}" -o json
+
+# ⚠️ CHECK QUOTA BEFORE ANYTHING ELSE
+az vm list-usage --location southeastasia -o table | grep -iE "Total Regional|Standard B"
+# If "Total Regional vCPUs" limit is 4, you can run exactly 2x Standard_B2ms. Plan accordingly.
+
+# Register resource providers (idempotent; takes ~5 min in the background)
+for p in Microsoft.ContainerService Microsoft.ContainerRegistry Microsoft.Network \
+         Microsoft.Storage Microsoft.KeyVault Microsoft.Sql Microsoft.Cache \
+         Microsoft.OperationalInsights Microsoft.Insights Microsoft.Monitor \
+         Microsoft.Dashboard Microsoft.ManagedIdentity Microsoft.Cdn \
+         Microsoft.PolicyInsights Microsoft.Security; do
+  az provider register --namespace $p --wait &
+done; wait
+echo "Providers registered."
+
+# Verify
+az provider list --query "[?registrationState=='Registered'].namespace" -o tsv | sort | head -30
+```
+
+### 21.3 Naming convention and environment file
+
+```bash
+mkdir -p ~/azureshop && cd ~/azureshop
+cat > .envrc << 'EOF'
+# ---- AzureShop environment ----
+export SUB_ID=$(az account list --query "[?isDefault].id" -o tsv)
+export TENANT_ID=$(az account show --query tenantId -o tsv)
+export LOCATION="southeastasia"
+export LOCATION_DR="eastasia"
+export PREFIX="azshop"
+export ENVNAME="lab"
+export SUFFIX="7f3a"                 # <-- CHANGE THIS to 4 random lowercase alphanum chars
+
+export RG="rg-${PREFIX}-${ENVNAME}-sea"
+export RG_STATE="rg-${PREFIX}-tfstate"
+export VNET="vnet-${PREFIX}-${ENVNAME}-sea"
+export AKS="aks-${PREFIX}-${ENVNAME}-sea"
+export ACR="acr${PREFIX}${ENVNAME}${SUFFIX}"
+export KV="kv-${PREFIX}-${SUFFIX}"
+export SA_STATE="st${PREFIX}tfstate${SUFFIX}"
+export SA_APP="st${PREFIX}${ENVNAME}${SUFFIX}"
+export LAW="law-${PREFIX}-${ENVNAME}-sea"
+export SQLSRV="sql-${PREFIX}-${ENVNAME}-${SUFFIX}"
+export REDIS="redis-${PREFIX}-${ENVNAME}-${SUFFIX}"
+export MY_IP="$(curl -s ifconfig.me)"
+export DESTROY_BY="$(date -u -d '+5 days' +%Y-%m-%d 2>/dev/null || date -u -v+5d +%Y-%m-%d)"
+EOF
+
+source .envrc
+echo "RG=$RG  ACR=$ACR  MY_IP=$MY_IP  DESTROY_BY=$DESTROY_BY"
+```
+
+> Run `source .envrc` at the start of **every** session.
+
+### 21.4 Create the resource group
+
+```bash
+az group create \
+  --name "$RG" \
+  --location "$LOCATION" \
+  --tags Project=AzureShop Environment=lab ManagedBy=Terraform \
+         Owner="$(az account show --query user.name -o tsv)" \
+         Lifecycle=ephemeral DestroyBy="$DESTROY_BY"
+
+az group show -n "$RG" --query "{name:name, location:location, tags:tags}" -o json
+```
+
+### 21.5 Budget alerts — do this BEFORE creating anything expensive
+
+```bash
+EMAIL=$(az account show --query user.name -o tsv)
+
+cat > /tmp/budget.json << EOF
+{
+  "category": "Cost",
+  "amount": 150,
+  "timeGrain": "Monthly",
+  "timePeriod": {
+    "startDate": "$(date -u +%Y-%m-01)T00:00:00Z",
+    "endDate":   "$(date -u -d '+1 year' +%Y-%m-01 2>/dev/null || date -u -v+1y +%Y-%m-01)T00:00:00Z"
+  },
+  "notifications": {
+    "at33": { "enabled": true, "operator": "GreaterThan", "threshold": 33,
+              "contactEmails": ["$EMAIL"], "contactRoles": ["Owner"] },
+    "at66": { "enabled": true, "operator": "GreaterThan", "threshold": 66,
+              "contactEmails": ["$EMAIL"], "contactRoles": ["Owner"] },
+    "at90": { "enabled": true, "operator": "GreaterThan", "threshold": 90,
+              "contactEmails": ["$EMAIL"], "contactRoles": ["Owner"] }
+  }
+}
+EOF
+
+az rest --method PUT \
+  --url "https://management.azure.com/subscriptions/$SUB_ID/providers/Microsoft.Consumption/budgets/budget-azureshop?api-version=2023-05-01" \
+  --body @/tmp/budget.json
+
+# Verify
+az consumption budget list -o table
+```
+> Thresholds fire at **$50, $99, $135** against a $150 budget. Also check the Portal: **Cost Management + Billing → Credits + commitments**, which is authoritative for free-credit balance.
+
+### 21.6 Bootstrap the Terraform backend
+
+```bash
+mkdir -p ~/azureshop/bootstrap && cd ~/azureshop/bootstrap
+
+cat > main.tf << 'EOF'
+terraform {
+  required_version = ">= 1.9.0"
+  required_providers {
+    azurerm = { source = "hashicorp/azurerm", version = "~> 4.0" }
+  }
+  # Intentionally LOCAL state - this config creates the remote backend itself.
+}
+
+provider "azurerm" {
+  features {}
+}
+
+variable "location" {
+  type    = string
+  default = "southeastasia"
+}
+variable "rg_state" { type = string }
+variable "sa_state" { type = string }
+
+resource "azurerm_resource_group" "state" {
+  name     = var.rg_state
+  location = var.location
+  tags = {
+    Project   = "AzureShop"
+    Purpose   = "terraform-state"
+    Lifecycle = "persistent"   # NOTE: keep this one; it is not ephemeral
+  }
+}
+
+resource "azurerm_storage_account" "state" {
+  name                            = var.sa_state
+  resource_group_name             = azurerm_resource_group.state.name
+  location                        = azurerm_resource_group.state.location
+  account_tier                    = "Standard"
+  account_replication_type        = "LRS"
+  min_tls_version                 = "TLS1_2"
+  allow_nested_items_to_be_public = false
+  shared_access_key_enabled       = false   # force Entra ID auth - no storage keys
+  blob_properties {
+    versioning_enabled = true               # state file version history = your undo button
+    delete_retention_policy { days = 7 }
+  }
+}
+
+resource "azurerm_storage_container" "tfstate" {
+  name                  = "tfstate"
+  storage_account_id    = azurerm_storage_account.state.id
+  container_access_type = "private"
+}
+# NOTE: azurerm >= 4.9 uses `storage_account_id`. On older 4.x releases this
+# argument is `storage_account_name = azurerm_storage_account.state.name`.
+# If `terraform validate` complains, swap it - your provider version is older.
+
+# Grant yourself data-plane access (Owner is NOT enough - remember the 3-layer model)
+data "azurerm_client_config" "current" {}
+
+resource "azurerm_role_assignment" "state_rbac" {
+  scope                = azurerm_storage_account.state.id
+  role_definition_name = "Storage Blob Data Contributor"
+  principal_id         = data.azurerm_client_config.current.object_id
+}
+
+output "backend_config" {
+  value = <<-EOT
+
+    Add this to envs/lab/backend.tf:
+
+    backend "azurerm" {
+      resource_group_name  = "${azurerm_resource_group.state.name}"
+      storage_account_name = "${azurerm_storage_account.state.name}"
+      container_name       = "tfstate"
+      key                  = "lab.terraform.tfstate"
+      use_azuread_auth     = true
+    }
+  EOT
+}
+EOF
+
+terraform init
+terraform apply -auto-approve \
+  -var="rg_state=$RG_STATE" \
+  -var="sa_state=$SA_STATE"
+
+terraform output backend_config
+```
+
+> **Role assignments take 1–5 minutes to propagate.** If the next `terraform init` fails with a 403, wait two minutes and retry. This is normal Azure behaviour, not a bug.
+
+### 21.7 First real Terraform deployment — the network module
+
+```bash
+mkdir -p ~/azureshop/modules/network ~/azureshop/envs/lab
+cd ~/azureshop/modules/network
+```
+
+`modules/network/variables.tf`:
+```hcl
+variable "resource_group_name" { type = string }
+variable "location"            { type = string }
+variable "name_prefix"         { type = string }
+
+variable "vnet_cidr" {
+  type    = string
+  default = "10.20.0.0/16"
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+```
+
+`modules/network/main.tf`:
+```hcl
+# ---------------------------------------------------------------- VNet
+resource "azurerm_virtual_network" "this" {
+  name                = "vnet-${var.name_prefix}"
+  resource_group_name = var.resource_group_name
+  location            = var.location
+  address_space       = [var.vnet_cidr]
+  tags                = var.tags
+}
+
+# ---------------------------------------------------------------- Subnets
+# NOTE: Azure subnets are REGIONAL. One subnet spans all availability zones.
+# There is no reason to create one subnet per zone.
+
+resource "azurerm_subnet" "aks" {
+  name                 = "snet-aks"
+  resource_group_name  = var.resource_group_name
+  virtual_network_name = azurerm_virtual_network.this.name
+  address_prefixes     = [cidrsubnet(var.vnet_cidr, 6, 0)] # 10.20.0.0/22
+}
+
+resource "azurerm_subnet" "appgw" {
+  name                 = "snet-appgw"                       # DEDICATED - App Gateway only
+  resource_group_name  = var.resource_group_name
+  virtual_network_name = azurerm_virtual_network.this.name
+  address_prefixes     = ["10.20.4.0/24"]
+}
+
+resource "azurerm_subnet" "pe" {
+  name                 = "snet-pe"
+  resource_group_name  = var.resource_group_name
+  virtual_network_name = azurerm_virtual_network.this.name
+  address_prefixes     = ["10.20.5.0/24"]
+}
+
+# ---------------------------------------------------------------- NSGs
+resource "azurerm_network_security_group" "aks" {
+  name                = "nsg-aks"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  tags                = var.tags
+
+  security_rule {
+    name                       = "AllowVnetHttp"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_ranges    = ["80", "443"]
+    source_address_prefix      = "VirtualNetwork"
+    destination_address_prefix = "*"
+  }
+
+  security_rule {
+    name                       = "DenyInternetInbound"
+    priority                   = 4000
+    direction                  = "Inbound"
+    access                     = "Deny"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_range     = "*"
+    source_address_prefix      = "Internet"
+    destination_address_prefix = "*"
+  }
+}
+
+resource "azurerm_network_security_group" "appgw" {
+  name                = "nsg-appgw"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  tags                = var.tags
+
+  # MANDATORY for Application Gateway v2. Omit this and the gateway
+  # provisions but never becomes healthy, with a very unhelpful error.
+  security_rule {
+    name                       = "AllowGatewayManager"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "65200-65535"
+    source_address_prefix      = "GatewayManager"
+    destination_address_prefix = "*"
+  }
+
+  # Only Front Door may reach the gateway. Service tag, not a CIDR list.
+  security_rule {
+    name                       = "AllowFrontDoorOnly"
+    priority                   = 110
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_ranges    = ["80", "443"]
+    source_address_prefix      = "AzureFrontDoor.Backend"
+    destination_address_prefix = "*"
+  }
+
+  security_rule {
+    name                       = "AllowAzureLoadBalancer"
+    priority                   = 120
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "*"
+    source_port_range          = "*"
+    destination_port_range     = "*"
+    source_address_prefix      = "AzureLoadBalancer"
+    destination_address_prefix = "*"
+  }
+}
+
+resource "azurerm_network_security_group" "pe" {
+  name                = "nsg-pe"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  tags                = var.tags
+
+  security_rule {
+    name                       = "AllowFromAks"
+    priority                   = 100
+    direction                  = "Inbound"
+    access                     = "Allow"
+    protocol                   = "Tcp"
+    source_port_range          = "*"
+    destination_port_range     = "*"
+    source_address_prefix      = "10.20.0.0/22"
+    destination_address_prefix = "*"
+  }
+}
+
+resource "azurerm_subnet_network_security_group_association" "aks" {
+  subnet_id                 = azurerm_subnet.aks.id
+  network_security_group_id = azurerm_network_security_group.aks.id
+}
+resource "azurerm_subnet_network_security_group_association" "appgw" {
+  subnet_id                 = azurerm_subnet.appgw.id
+  network_security_group_id = azurerm_network_security_group.appgw.id
+}
+resource "azurerm_subnet_network_security_group_association" "pe" {
+  subnet_id                 = azurerm_subnet.pe.id
+  network_security_group_id = azurerm_network_security_group.pe.id
+}
+
+# ---------------------------------------------------------------- Egress
+# Azure is retiring DEFAULT OUTBOUND ACCESS, so explicit egress is mandatory.
+resource "azurerm_public_ip" "nat" {
+  name                = "pip-nat-${var.name_prefix}"
+  location            = var.location
+  resource_group_name = var.resource_group_name
+  allocation_method   = "Static"
+  sku                 = "Standard"
+  zones               = ["1", "2", "3"]
+  tags                = var.tags
+}
+
+resource "azurerm_nat_gateway" "this" {
+  name                    = "nat-${var.name_prefix}"
+  location                = var.location
+  resource_group_name     = var.resource_group_name
+  sku_name                = "Standard"
+  idle_timeout_in_minutes = 4
+  tags                    = var.tags
+}
+
+resource "azurerm_nat_gateway_public_ip_association" "this" {
+  nat_gateway_id       = azurerm_nat_gateway.this.id
+  public_ip_address_id = azurerm_public_ip.nat.id
+}
+
+resource "azurerm_subnet_nat_gateway_association" "aks" {
+  subnet_id      = azurerm_subnet.aks.id
+  nat_gateway_id = azurerm_nat_gateway.this.id
+}
+
+# ---------------------------------------------------------------- Private DNS
+# WITHOUT these zones + VNet links, private endpoints resolve to PUBLIC IPs
+# and everything appears to work while traffic leaves your VNet.
+locals {
+  private_dns_zones = {
+    sql     = "privatelink.database.windows.net"
+    redis   = "privatelink.redis.cache.windows.net"
+    blob    = "privatelink.blob.core.windows.net"
+    kv      = "privatelink.vaultcore.azure.net"
+    acr     = "privatelink.azurecr.io"
+  }
+}
+
+resource "azurerm_private_dns_zone" "this" {
+  for_each            = local.private_dns_zones
+  name                = each.value
+  resource_group_name = var.resource_group_name
+  tags                = var.tags
+}
+
+resource "azurerm_private_dns_zone_virtual_network_link" "this" {
+  for_each              = local.private_dns_zones
+  name                  = "link-${each.key}"
+  resource_group_name   = var.resource_group_name
+  private_dns_zone_name = azurerm_private_dns_zone.this[each.key].name
+  virtual_network_id    = azurerm_virtual_network.this.id
+  registration_enabled  = false
+  tags                  = var.tags
+}
+```
+
+`modules/network/outputs.tf`:
+```hcl
+output "vnet_id"         { value = azurerm_virtual_network.this.id }
+output "vnet_name"       { value = azurerm_virtual_network.this.name }
+output "aks_subnet_id"   { value = azurerm_subnet.aks.id }
+output "appgw_subnet_id" { value = azurerm_subnet.appgw.id }
+output "pe_subnet_id"    { value = azurerm_subnet.pe.id }
+output "nat_public_ip"   { value = azurerm_public_ip.nat.ip_address }
+output "private_dns_zone_ids" {
+  value = { for k, v in azurerm_private_dns_zone.this : k => v.id }
+}
+```
+
+`envs/lab/main.tf`:
+```hcl
+provider "azurerm" {
+  features {
+    resource_group {
+      prevent_deletion_if_contains_resources = false   # lab only - lets destroy work cleanly
+    }
+    key_vault {
+      purge_soft_delete_on_destroy    = true           # lets you rebuild with the same name
+      recover_soft_deleted_key_vaults = true
+    }
+  }
+}
+
+data "azurerm_client_config" "current" {}
+
+locals {
+  name_prefix = "${var.prefix}-${var.env}-sea"
+  is_prod     = var.mode == "production"
+  tags = {
+    Project     = "AzureShop"
+    Environment = var.env
+    ManagedBy   = "Terraform"
+    Mode        = var.mode
+    Lifecycle   = "ephemeral"
+    DestroyBy   = var.destroy_by
+  }
+}
+
+resource "azurerm_resource_group" "this" {
+  name     = "rg-${local.name_prefix}"
+  location = var.location
+  tags     = local.tags
+}
+
+module "network" {
+  source              = "../../modules/network"
+  resource_group_name = azurerm_resource_group.this.name
+  location            = var.location
+  name_prefix         = local.name_prefix
+  vnet_cidr           = var.vnet_cidr
+  tags                = local.tags
+}
+
+output "nat_egress_ip"  { value = module.network.nat_public_ip }
+output "resource_group" { value = azurerm_resource_group.this.name }
+```
+
+`envs/lab/variables.tf`:
+```hcl
+variable "destroy_by" { type = string }
+
+variable "prefix" {
+  type    = string
+  default = "azshop"
+}
+
+variable "env" {
+  type    = string
+  default = "lab"
+}
+
+variable "location" {
+  type    = string
+  default = "southeastasia"
+}
+
+variable "vnet_cidr" {
+  type    = string
+  default = "10.20.0.0/16"
+}
+variable "mode" {
+  type    = string
+  default = "lab"
+  validation {
+    condition     = contains(["lab", "production"], var.mode)
+    error_message = "mode must be 'lab' or 'production'."
+  }
+}
+```
+
+**Deploy it:**
+```bash
+cd ~/azureshop/envs/lab
+
+# Create backend.tf with the values printed by the bootstrap output
+cat > backend.tf << EOF
+terraform {
+  required_version = ">= 1.9.0"
+  required_providers {
+    azurerm = { source = "hashicorp/azurerm", version = "~> 4.0" }
+    azuread = { source = "hashicorp/azuread", version = "~> 3.0" }
+    random  = { source = "hashicorp/random",  version = "~> 3.6" }
+  }
+  backend "azurerm" {
+    resource_group_name  = "$RG_STATE"
+    storage_account_name = "$SA_STATE"
+    container_name       = "tfstate"
+    key                  = "lab.terraform.tfstate"
+    use_azuread_auth     = true
+  }
+}
+EOF
+
+terraform init
+terraform fmt -recursive
+terraform validate
+terraform plan -var="destroy_by=$DESTROY_BY" -out=tfplan
+terraform apply tfplan
+```
+
+### 21.8 Day 1 verification
+
+```bash
+# 1. State is remote and locked
+terraform state list
+az storage blob list --account-name "$SA_STATE" -c tfstate --auth-mode login -o table
+
+# 2. Network exists and is correct
+az network vnet subnet list -g "$RG" --vnet-name "vnet-azshop-lab-sea" \
+  --query "[].{name:name, prefix:addressPrefix, nsg:networkSecurityGroup.id}" -o table
+
+# 3. NAT gateway attached, egress IP known
+terraform output nat_egress_ip
+
+# 4. Private DNS zones linked (must show 5)
+az network private-dns zone list -g "$RG" --query "length(@)"
+for z in privatelink.database.windows.net privatelink.vaultcore.azure.net; do
+  az network private-dns link vnet list -g "$RG" -z "$z" -o table
+done
+
+# 5. NSG rules present - especially GatewayManager
+az network nsg rule list -g "$RG" --nsg-name nsg-appgw \
+  --query "[].{name:name, priority:priority, src:sourceAddressPrefix, ports:destinationPortRange}" -o table
+```
+
+**Definition of done for Day 1:**
+- [ ] `terraform apply` completes with no errors
+- [ ] `terraform destroy && terraform apply` rebuilds everything in under 5 minutes
+- [ ] All 5 private DNS zones exist **and are linked to the VNet**
+- [ ] `nsg-appgw` contains the `GatewayManager` 65200-65535 rule
+- [ ] Budget alerts are visible in Cost Management
+- [ ] You can explain out loud why a subnet in Azure spans availability zones
+
+### 21.9 Day 1 cleanup (if you're stopping for more than a day)
+
+```bash
+cd ~/azureshop/envs/lab
+terraform destroy -var="destroy_by=$DESTROY_BY" -auto-approve
+
+# Verify nothing is left billing
+az resource list -g "$RG" -o table          # should be empty or RG gone
+az network public-ip list -o table          # should be empty
+```
+> The state storage account (~$0.02/month) is worth keeping. Everything else goes.
+
+**WHAT DAY 1 COSTS:** roughly **$1.50/day** if you leave it up — NAT Gateway ~$1.08 + Standard public IP ~$0.12 + a few cents of storage. VNets, subnets, NSGs, route tables, and private DNS zones are **free**. If you destroy at the end of the session, Day 1 costs well under $0.50.
+
+---
+
+## 22. Troubleshooting
+
+### 22.1 Azure authentication failure
+**Symptoms:** `AADSTS50076`, `Please run 'az login'`, token expired mid-`terraform apply`.
+**Likely cause:** Expired CLI token, wrong tenant, or MFA required.
+```bash
+az account show
+az login --tenant "$TENANT_ID"
+az account clear && az login          # nuclear option
+az account get-access-token --query expiresOn -o tsv
+```
+**Fix:** For Terraform specifically, ensure `ARM_SUBSCRIPTION_ID` is set — provider v4 requires it explicitly, unlike v3.
+
+### 22.2 RBAC permission denied
+**Symptoms:** `AuthorizationFailed`, `does not have authorization to perform action`, or a 403 from a *data* plane despite being Owner.
+```bash
+# What do I actually have, and where?
+az role assignment list --assignee "$(az ad signed-in-user show --query id -o tsv)" \
+  --all --include-inherited -o table
+
+# What does this specific role grant?
+az role definition list -n "Key Vault Secrets User" --query "[0].permissions" -o json
+```
+**Fix:** Remember the three layers. `Owner` (control plane) ≠ `Key Vault Secrets User` (data plane) ≠ `Storage Blob Data Contributor` (data plane). **Role assignments take 1–5 minutes to propagate** — a 403 immediately after assignment is usually just propagation.
+
+### 22.3 Terraform state problems
+**Symptoms:** `Error acquiring the state lock`, `state blob is already locked`.
+```bash
+# Read the lock ID from the error message, then:
+terraform force-unlock <LOCK_ID>
+
+# If that fails, break the blob lease directly
+az storage blob lease break --account-name "$SA_STATE" \
+  -c tfstate -b lab.terraform.tfstate --auth-mode login
+```
+**Symptoms:** resource exists in Azure but not in state (partial apply).
+```bash
+terraform import module.network.azurerm_virtual_network.this \
+  "/subscriptions/$SUB_ID/resourceGroups/$RG/providers/Microsoft.Network/virtualNetworks/vnet-azshop-lab-sea"
+```
+**Prevention:** blob versioning is enabled in the bootstrap — you can restore a previous state version from the Portal.
+
+### 22.4 AKS networking issues
+**Symptoms:** Pods `Pending` with `Insufficient cpu`; pods can't reach the internet; node `NotReady`.
+```bash
+kubectl describe node | grep -A8 "Allocated resources"
+kubectl get events -A --sort-by=.lastTimestamp | tail -30
+kubectl run egress --rm -it --image=nicolaka/netshoot --restart=Never -- curl -sI https://mcr.microsoft.com
+```
+**Fixes:**
+| Symptom | Cause | Fix |
+|---|---|---|
+| `Insufficient cpu` | Requests exceed allocatable | Lower requests, or scale the node pool |
+| `0/1 nodes available: node(s) had untolerated taint` | Only the tainted system pool exists | Add a user pool, or add a toleration |
+| No internet from pods | No explicit egress (default outbound access retirement) | Attach the NAT Gateway; set `--outbound-type userAssignedNATGateway` |
+| `too many pods` | `maxPods` reached | Increase `--max-pods` (needs pool recreation) or add nodes |
+
+### 22.5 DNS issues
+**Symptoms:** in-cluster service names don't resolve; external names don't resolve.
+```bash
+kubectl -n kube-system get pods -l k8s-app=kube-dns
+kubectl -n kube-system logs -l k8s-app=kube-dns --tail=50
+kubectl run dns --rm -it --image=nicolaka/netshoot --restart=Never -- \
+  sh -c 'nslookup kubernetes.default; nslookup mcr.microsoft.com; cat /etc/resolv.conf'
+```
+
+### 22.6 Private endpoint connectivity ⭐ the big one
+**Symptoms:** connection timeout to SQL/Redis/Storage — or worse, it *works* but traffic is going over the internet.
+```bash
+# THE diagnostic. Run it from a pod, not your laptop.
+kubectl run pe --rm -it --image=nicolaka/netshoot --restart=Never -- \
+  sh -c 'nslookup sql-azshop-XXXX.database.windows.net; nc -zv sql-azshop-XXXX.database.windows.net 1433'
+```
+| Result | Meaning | Fix |
+|---|---|---|
+| Resolves to `10.20.5.x`, connects | ✅ Correct | — |
+| Resolves to a **public IP** | Private DNS zone missing or not linked | Create zone + VNet link + verify the `private_dns_zone_group` on the PE |
+| Resolves to `10.20.5.x`, **times out** | NSG on `snet-pe` blocking, or PE not approved | Check `nsg-pe`; `az network private-endpoint-connection list` |
+| `no such host` | Zone name typo | Compare character-for-character with §8.3 |
+```bash
+az network private-endpoint list -g "$RG" -o table
+az network private-dns record-set a list -g "$RG" -z privatelink.database.windows.net -o table
+```
+
+### 22.7 ACR authentication failure
+**Symptoms:** `401 Unauthorized` on pull; `unauthorized: authentication required`.
+```bash
+KUBELET=$(az aks show -g "$RG" -n "$AKS" --query identityProfile.kubeletidentity.objectId -o tsv)
+az role assignment list --assignee "$KUBELET" --scope "$(az acr show -n "$ACR" --query id -o tsv)" -o table
+az aks check-acr -g "$RG" -n "$AKS" --acr "$ACR.azurecr.io"     # purpose-built diagnostic
+```
+**Fix:** `az aks update -g "$RG" -n "$AKS" --attach-acr "$ACR"`
+
+### 22.8 ImagePullBackOff — read the *specific* error
+```bash
+kubectl describe pod <pod> | grep -A10 Events
+```
+| Error text | Cause | Fix |
+|---|---|---|
+| `401 Unauthorized` | Missing `AcrPull` | `--attach-acr` |
+| `manifest unknown` / `not found` | Wrong tag or repo | `az acr repository show-tags -n $ACR --repository azureshop-api` |
+| `no such host` | DNS / private endpoint for ACR broken | §22.6 |
+| `context deadline exceeded` | No egress from nodes | Check NAT Gateway |
+| `ErrImagePull` + `denied` | Image in a different registry | Check the full image path |
+
+### 22.9 CrashLoopBackOff
+```bash
+kubectl logs <pod> --previous               # ← the flag that matters
+kubectl describe pod <pod> | grep -A8 "Last State"
+kubectl get events --field-selector involvedObject.name=<pod>
+```
+| Exit code | Meaning |
+|---|---|
+| 0 | Process completed — likely a missing long-running command |
+| 1 | Application error — read the logs |
+| **137** | **OOMKilled** — raise the memory limit |
+| 139 | Segfault |
+| 143 | SIGTERM (graceful shutdown, usually fine) |
+
+### 22.10 Ingress problems
+```bash
+kubectl get endpoints -n azureshop            # <none> = selector mismatch or readiness failing
+kubectl -n app-routing-system get svc,pods
+kubectl -n app-routing-system logs -l app=nginx --tail=100
+kubectl get ingress -n azureshop -o yaml | grep -A5 status
+```
+**Most common:** the Service has no endpoints because pods are failing readiness, or `ingressClassName` is wrong (must be `webapprouting.kubernetes.azure.com` for the app routing add-on).
+
+### 22.11 Key Vault access denied
+```bash
+az keyvault secret show --vault-name "$KV" -n demo-secret        # works for you?
+az role assignment list --scope "$(az keyvault show -n "$KV" --query id -o tsv)" -o table
+az keyvault show -n "$KV" --query "{rbac:properties.enableRbacAuthorization, net:properties.networkAcls}" -o json
+```
+| Cause | Fix |
+|---|---|
+| RBAC model but you granted an access policy (or vice versa) | Check `enableRbacAuthorization` and match the model |
+| Missing `Key Vault Secrets User` on the workload identity | Assign it, wait 2 min |
+| `networkAcls.defaultAction = Deny` and you're calling from outside the VNet | Add your IP, or call from a pod |
+| Vault name reserved by soft-delete | `az keyvault list-deleted` → `az keyvault purge` |
+
+### 22.12 Workload identity failure — three distinct signatures
+```bash
+kubectl exec -n azureshop deploy/azureshop-api -- env | grep AZURE_
+kubectl exec -n azureshop deploy/azureshop-api -- cat /var/run/secrets/azure/tokens/azure-identity-token | head -c 50
+az identity federated-credential list --identity-name id-azureshop-workload -g "$RG" -o table
+az aks show -g "$RG" -n "$AKS" --query oidcIssuerProfile -o json
+```
+| Signature | Cause |
+|---|---|
+| **No `AZURE_*` env vars at all** | Missing pod label `azure.workload.identity/use: "true"` |
+| `AADSTS70021: No matching federated identity record` | Federated credential subject doesn't match `system:serviceaccount:<ns>:<sa>`, or the wrong issuer URL |
+| `AADSTS700016: Application not found` | Wrong `client-id` in the SA annotation |
+| Token issued, then **403** from the resource | Authentication worked; **Azure RBAC** role missing on the target resource |
+
+### 22.13 GitHub OIDC failure
+| Error | Cause | Fix |
+|---|---|---|
+| `Unable to get ACTIONS_ID_TOKEN_REQUEST_URL` | Missing `permissions: id-token: write` | Add it to the workflow or job |
+| `AADSTS70021: No matching federated identity record` | Subject mismatch | Compare the workflow's actual ref/environment to the federated credential subject, character for character |
+| `AADSTS700213: No matching federated identity record found for presented assertion subject` | Running from a PR/fork but the credential is bound to `ref:refs/heads/main` | Add a second federated credential for `pull_request` or use an Environment-scoped one |
+| Login succeeds, `terraform apply` gets 403 | Service principal lacks an Azure RBAC role | `az role assignment create --assignee-object-id <sp> --role Contributor --scope <rg>` |
+| `ARM_SUBSCRIPTION_ID` errors | azurerm v4 requires it explicitly | Set it in `env:` |
+
+---
+
+## 23. Cost Monitoring Commands
+
+### 23.1 The daily audit script
+
+`scripts/audit-cost.sh` — **run this at the end of every session.**
+
+```bash
+#!/usr/bin/env bash
+set -uo pipefail
+echo "=========================================================="
+echo " AzureShop cost audit  -  $(date -u)"
+echo "=========================================================="
+
+echo
+echo "### 1. EXPENSIVE RESOURCES (should be EMPTY outside a prod-mode lab)"
+echo "--- Application Gateways (~\$10.60/day each) ---"
+az network application-gateway list --query "[].{name:name,rg:resourceGroup,sku:sku.name}" -o table
+echo "--- Front Door profiles ---"
+az afd profile list --query "[].{name:name,rg:resourceGroup,sku:sku.name}" -o table 2>/dev/null
+echo "--- Azure Firewalls (\$900+/month - MUST be empty) ---"
+az network firewall list --query "[].name" -o table
+echo "--- Bastion hosts (~\$4.50/day) ---"
+az network bastion list --query "[].name" -o table 2>/dev/null
+
+echo
+echo "### 2. ORPHANED RESOURCES (bill forever, invisible)"
+echo "--- Unattached public IPs ---"
+az network public-ip list \
+  --query "[?ipConfiguration==null && natGateway==null].{name:name,rg:resourceGroup,ip:ipAddress}" -o table
+echo "--- Unattached managed disks ---"
+az disk list --query "[?diskState=='Unattached'].{name:name,rg:resourceGroup,gb:diskSizeGb}" -o table
+echo "--- NAT gateways not attached to a subnet ---"
+az network nat gateway list \
+  --query "[?subnets==null].{name:name,rg:resourceGroup}" -o table
+echo "--- Load balancers with no backend pool members ---"
+az network lb list --query "[].{name:name,rg:resourceGroup,pools:length(backendAddressPools)}" -o table
+
+echo
+echo "### 3. RUNNING COMPUTE"
+az aks list --query "[].{name:name,rg:resourceGroup,tier:sku.tier,nodes:agentPoolProfiles[].count}" -o table
+az vmss list --query "[].{name:name,rg:resourceGroup,capacity:sku.capacity,size:sku.name}" -o table
+
+echo
+echo "### 4. DATA SERVICES"
+az redis list --query "[].{name:name,sku:sku.name,size:sku.family}" -o table 2>/dev/null
+az sql db list --ids $(az sql server list --query "[].id" -o tsv 2>/dev/null) \
+  --query "[].{name:name,sku:currentServiceObjectiveName}" -o table 2>/dev/null
+az acr list --query "[].{name:name,sku:sku.name}" -o table
+
+echo
+echo "### 5. LOG INGESTION (check the daily cap is set)"
+az monitor log-analytics workspace list \
+  --query "[].{name:name,capGb:workspaceCapping.dailyQuotaGb,retention:retentionInDays}" -o table
+
+echo
+echo "### 6. ALL RESOURCES BY GROUP"
+az resource list --query "[].resourceGroup" -o tsv | sort | uniq -c | sort -rn
+
+echo
+echo "### 7. SPEND (last 7 days, top 15)"
+az consumption usage list \
+  --start-date "$(date -u -d '7 days ago' +%Y-%m-%d 2>/dev/null || date -u -v-7d +%Y-%m-%d)" \
+  --end-date "$(date -u +%Y-%m-%d)" \
+  --query "[].{svc:meterDetails.meterCategory, cost:pretaxCost}" -o tsv 2>/dev/null \
+  | awk -F'\t' '{s[$1]+=$2} END {for (k in s) printf "%-42s %8.2f\n", k, s[k]}' | sort -k2 -rn | head -15
+
+echo
+echo "### 8. RESOURCES PAST THEIR DESTROY DATE"
+TODAY=$(date -u +%Y-%m-%d)
+az resource list --query "[?tags.DestroyBy != null && tags.DestroyBy < '$TODAY'].{name:name,type:type,destroyBy:tags.DestroyBy}" -o table
+
+echo
+echo "=========================================================="
+echo " Portal (authoritative credit balance):"
+echo " Cost Management + Billing -> Credits + commitments"
+echo "=========================================================="
+```
+
+```bash
+chmod +x scripts/audit-cost.sh && ./scripts/audit-cost.sh
+```
+
+### 23.2 Quick one-liners
+
+```bash
+# What's costing the most, last 3 days
+az consumption usage list \
+  --start-date $(date -u -d '3 days ago' +%Y-%m-%d) --end-date $(date -u +%Y-%m-%d) \
+  --query "[].{r:instanceName,c:pretaxCost}" -o tsv \
+  | awk -F'\t' '{s[$1]+=$2} END {for(k in s) printf "%-50s %8.2f\n",k,s[k]}' | sort -k2 -rn | head
+
+# Anything with a public IP (attack surface AND cost)
+az network public-ip list --query "[].{name:name,ip:ipAddress,attached:ipConfiguration!=null}" -o table
+
+# Log ingestion volume by table, last 24h
+az monitor log-analytics query \
+  --workspace $(az monitor log-analytics workspace show -g "$RG" -n "$LAW" --query customerId -o tsv) \
+  --analytics-query "Usage | where TimeGenerated > ago(24h) | summarize GB=sum(Quantity)/1024 by DataType | order by GB desc" -o table
+```
+
+---
+
+## 24. Teardown Strategy
+
+### 24.1 The correct order — this order matters
+
+```bash
+#!/usr/bin/env bash
+# scripts/nuke.sh
+set -uo pipefail
+source ~/azureshop/.envrc
+
+echo "!!! This destroys ALL AzureShop resources. Ctrl-C now to abort."
+sleep 5
+
+# ---- STEP 1: Delete Kubernetes LoadBalancer Services FIRST ----
+# These create Azure Load Balancers and Public IPs OUTSIDE Terraform state.
+# If you skip this, the LB and IP survive terraform destroy and bill forever.
+for CTX in $(kubectl config get-contexts -o name 2>/dev/null); do
+  echo "Cleaning services in context $CTX"
+  kubectl --context="$CTX" delete svc --all --all-namespaces --ignore-not-found 2>/dev/null
+done
+sleep 60   # give the cloud-controller-manager time to release the Azure resources
+
+# ---- STEP 2: Destroy DR region (separate state) ----
+if [ -d ~/azureshop/envs/dr ]; then
+  (cd ~/azureshop/envs/dr && terraform destroy -auto-approve) || true
+fi
+
+# ---- STEP 3: Destroy primary ----
+(cd ~/azureshop/envs/lab && terraform destroy -var="destroy_by=$DESTROY_BY" -auto-approve) || true
+
+# ---- STEP 4: Force-delete resource groups (catches anything Terraform missed) ----
+for G in "$RG" "rg-${PREFIX}-dr-eas"; do
+  az group delete -n "$G" --yes --no-wait 2>/dev/null && echo "Deleting $G"
+done
+
+# ---- STEP 5: AKS node resource groups (MC_*) ----
+az group list --query "[?starts_with(name,'MC_')].name" -o tsv | while read -r G; do
+  echo "Deleting node resource group $G"
+  az group delete -n "$G" --yes --no-wait
+done
+
+# ---- STEP 6: Purge soft-deleted Key Vaults (frees the NAME for rebuilds) ----
+az keyvault list-deleted --query "[].{n:name,l:properties.location}" -o tsv | while read -r N L; do
+  echo "Purging vault $N"
+  az keyvault purge --name "$N" --location "$L" 2>/dev/null || \
+    echo "  Could not purge $N (purge protection enabled - wait out the retention period)"
+done
+
+# ---- STEP 7: Orphans ----
+az network public-ip list --query "[?ipConfiguration==null && natGateway==null].id" -o tsv \
+  | xargs -r -n1 az network public-ip delete --ids
+az disk list --query "[?diskState=='Unattached'].id" -o tsv \
+  | xargs -r -n1 az disk delete --yes --ids
+
+# ---- STEP 8: Entra ID objects (NOT in any resource group) ----
+echo "Entra ID objects still present (delete manually if done for good):"
+az ad app list --display-name "gh-azureshop-oidc" --query "[].{name:displayName,id:appId}" -o table
+
+# ---- VERIFY ----
+sleep 30
+echo
+echo "=== REMAINING RESOURCE GROUPS ==="
+az group list -o table
+echo "=== REMAINING PUBLIC IPS (should be empty) ==="
+az network public-ip list -o table
+echo "=== REMAINING DISKS (should be empty) ==="
+az disk list -o table
+echo
+echo "Only rg-${PREFIX}-tfstate should remain. Delete it too if you are finished:"
+echo "  az group delete -n $RG_STATE --yes"
+```
+
+### 24.2 Things that survive `terraform destroy` — the checklist
+
+| Thing | Why it survives | How to remove |
+|---|---|---|
+| **Azure LB + public IP from `Service type=LoadBalancer`** | Created by the Kubernetes cloud provider, not Terraform | Delete the K8s Services **before** destroy |
+| **`MC_*` node resource group** | AKS-managed, usually cleaned up but sometimes orphaned | `az group delete -n MC_...` |
+| **Soft-deleted Key Vaults** | Soft-delete retention reserves the name | `az keyvault purge` |
+| **Entra ID app registrations & federated credentials** | Tenant-level, not in any subscription/RG | `az ad app delete --id <appId>` |
+| **Role assignments at subscription scope** | Outside the RG | `az role assignment delete` |
+| **Diagnostic settings** | Attached to resources, sometimes linger | Usually gone with the resource |
+| **Budgets** | Subscription-scoped | `az consumption budget delete` (keep it — it's free and protective) |
+| **Terraform state storage account** | Deliberately in a separate RG | Delete last, on purpose |
+
+### 24.3 Rebuild-from-Git test — do this on Day 3
+
+The whole point of this project is that the platform lives in Git, not in your subscription.
+
+```bash
+# Destroy everything
+./scripts/nuke.sh
+
+# Clone fresh into a new directory
+cd /tmp && git clone https://github.com/YOURUSER/azureshop.git rebuild-test
+cd rebuild-test
+
+# Bootstrap + apply
+cd bootstrap && terraform init && terraform apply -auto-approve \
+  -var="rg_state=$RG_STATE" -var="sa_state=$SA_STATE"
+cd ../envs/lab && terraform init && terraform apply -auto-approve -var="destroy_by=$DESTROY_BY"
+
+# Deploy workloads
+az aks get-credentials -g "$RG" -n "$AKS" --overwrite-existing
+kubectl apply -k k8s/overlays/lab
+
+# TIME IT. Record the number. It goes in your README.
+```
+> **"I can rebuild this entire platform from an empty subscription in N minutes"** is one of the strongest things you can say in a platform engineering interview. Measure N.
+
+---
+
+## 25. Interview Questions
+
+Thirty-two questions grounded in what you actually built. Key points to hit, not scripts to memorise.
+
+### AKS Architecture
+
+**1. Walk me through your AKS network design and why you chose Azure CNI Overlay.**
+Overlay assigns pod IPs from a separate CIDR (`192.168.0.0/16`) routed by Azure, so only *nodes* consume VNet IPs. Traditional Azure CNI pre-allocates `maxPods` VNet IPs per node — 10 nodes × 30 pods = 300 IPs reserved before you run anything, which is the Azure analogue of the AWS VPC CNI ENI-limit problem. Overlay lets a /22 subnet support ~1000 nodes. Trade-off: pods aren't directly routable from peered VNets or on-prem, which matters only if something outside the cluster must dial a pod IP directly.
+
+**2. What's the difference between a system and a user node pool, and why does it matter?**
+The system pool hosts critical add-ons (CoreDNS, metrics-server, konnectivity). AKS enforces at least one, it can't be Spot, and it can't scale to zero if it's the only one. I taint it `CriticalAddonsOnly=true:NoSchedule` so application pods land on user pools. EKS has no such concept — there you'd achieve the same with taints and labels on a dedicated managed node group, but nothing enforces it.
+
+**3. When would you use the AKS Free tier vs Standard vs Premium?**
+Free: $0/hr, no SLA, recommended under 10 nodes — dev/test/labs. Standard: $0.10/cluster/hr, 99.95% API server SLA with availability zones (99.9% without), higher etcd/API limits, up to 5000 nodes — production default. Premium: $0.60/cluster/hr, adds long-term support for up to two years on a Kubernetes version — regulated or slow-moving estates. Note that unlike EKS, which charges $0.10/hr universally, AKS genuinely gives you a free control plane.
+
+**4. How do you make an AKS cluster zone-resilient, and what's the Azure-specific catch?**
+Pass `--zones 1 2 3` on the node pool; AKS spreads the underlying VMSS instances. The catch is that **Azure subnets are regional, not zonal** — so unlike AWS, you don't create a subnet per AZ. Zone placement is a property of the node pool. Then use `topologySpreadConstraints` on `topology.kubernetes.io/zone` to spread pods, and remember that the control plane's zone redundancy is a separate concern covered by the Standard tier SLA.
+
+**5. Your PDB is `minAvailable: 1` and the deployment has 1 replica. What happens during a node upgrade?**
+The drain blocks forever. Evicting the single pod would violate the budget, so the eviction API refuses, and the node upgrade hangs. Fix: run at least 2 replicas, or use `maxUnavailable: 1` instead. This is a classic production outage during cluster upgrades.
+
+**6. What's the current state of ingress on AKS?**
+SIG Network retired ingress-nginx with maintenance ending March 2026. Microsoft is providing security patches for the app routing add-on's managed NGINX through November 2026, and AKS is aligning with upstream on Gateway API as the long-term standard. As of AKS release v20260428, managed Gateway API and the Istio-based app routing Gateway API implementation are GA. So the migration path is: standalone NGINX → app routing add-on (buys supported time) → Gateway API, or → Application Gateway for Containers if you want Azure-native WAF at ingress. AGC supports both Ingress and Gateway API but currently only external frontends, so if you need a private frontend, AGIC is still the option.
+
+### Azure Networking
+
+**7. How does an Azure VNet differ from a VPC in ways that change your design?**
+Three material differences. (a) Subnets are regional, not zonal — huge simplification of CIDR planning. (b) NSGs have explicit deny rules with priority ordering and can attach to subnets *or* NICs, effectively merging SGs and NACLs. (c) There's no Internet Gateway resource; internet routing is a system route you override, and **default outbound access is being retired**, so every workload now needs an explicit egress path via NAT Gateway or LB outbound rules.
+
+**8. Explain Private Endpoints and the failure mode you have to watch for.**
+A Private Endpoint creates a NIC in your subnet with a private IP mapped to a PaaS resource. The failure mode: it does **not** change DNS by itself. Without a `privatelink.*` Private DNS zone linked to the VNet with the right A record, `nslookup` returns the resource's public IP and your traffic silently leaves the VNet over the internet. Nothing errors. My standard verification is `nslookup` from inside a pod and confirming the answer is in my private endpoint subnet range.
+
+**9. Service Endpoints vs Private Endpoints?**
+Service Endpoints keep traffic on the Azure backbone and let you restrict the resource's firewall to a subnet, but the resource keeps its public IP and public DNS. Private Endpoints give the resource a private IP in your VNet, work across peering and ExpressRoute, and let you fully disable public network access. Private Endpoints cost ~$0.01/hr each plus per-GB; Service Endpoints are free. Use Private Endpoints for anything holding data.
+
+**10. What NSG rule is mandatory for Application Gateway v2, and what happens without it?**
+Inbound TCP 65200–65535 from the `GatewayManager` service tag. Without it the gateway provisions but never reaches a healthy state, because the Azure control plane can't reach the instances for health and configuration management. The error message is unhelpful, which is why this is such a common interview question.
+
+**11. How would you restrict your origin so only Front Door can reach it?**
+Two layers. Network: an NSG rule allowing only the `AzureFrontDoor.Backend` service tag on 80/443, denying `Internet`. Application: validate the `X-Azure-FDID` header matches your specific Front Door profile ID, because the service tag covers *all* Front Door tenants, not just yours. On Front Door Premium you skip both by using a Private Link origin.
+
+### Front Door, App Gateway, WAF
+
+**12. When do you use Front Door, Application Gateway, or both?**
+Front Door is global — anycast edge, CDN, global load balancing, health-probe regional failover, DDoS protection. Application Gateway is regional — VNet-injected L7 with a private frontend option, mTLS, and per-URL routing inside one region. Both together when you need global routing *and* a regional WAF/VNet-internal entry point. For a single-region app, App Gateway alone is usually enough; the moment you're multi-region, Front Door is what does the failover.
+
+**13. Compare the two WAF pricing models.**
+Application Gateway WAF v2 bills ~$0.443 per gateway-hour plus ~$0.0144 per capacity-unit-hour — you pay before a single request arrives, roughly $320+/month floor. Front Door bundles WAF into the tier: Standard ~$35/month includes custom rules only; Premium ~$330/month includes Microsoft-managed rule sets, bot protection, and Private Link origins. For low-traffic services, App Gateway WAF is expensive; for high-traffic global services, Front Door Premium's bundled model usually wins. Getting this wrong can double the bill.
+
+**14. What exactly is Front Door Premium buying you over Standard?**
+Managed WAF rule sets (Microsoft-maintained, threat-intel-backed), bot protection, and Private Link to origin. Private Link is the one that changes architecture: it lets Front Door reach a backend that has no public endpoint at all. Standard gives you the CDN, routing, caching, health probes, failover, and custom WAF rules — everything except those. So the decision reduces to: do I need managed rules or a private origin?
+
+**15. How does Front Door failover work, and why is it faster than DNS failover?**
+Origins sit in origin groups with priority and weight. Front Door health-probes each origin on a configured path and interval. When an origin fails the sample threshold, Front Door stops routing to it and promotes the next priority. Detection is typically 30–90 seconds. It's faster and more reliable than Route 53-style DNS failover because there's no TTL — the anycast edge simply routes elsewhere, so no client or intermediate resolver can cache a stale answer.
+
+### Entra ID and Workload Identity
+
+**16. Explain the difference between Entra ID and Azure RBAC.**
+Entra ID is the identity provider — it answers *who are you*, issues tokens, and is tenant-wide and global. Azure RBAC is the authorisation system for ARM resources — it answers *what can you do to this resource*, via role assignments at a scope. And there's a third layer: data-plane authorisation. Being `Owner` on a Key Vault lets you manage the vault; reading a secret needs `Key Vault Secrets User`. AWS collapses all of this into one policy engine, which is why AWS engineers get 403s they don't expect.
+
+**17. Walk me through Workload Identity end to end.**
+AKS exposes an OIDC issuer endpoint. A ServiceAccount is annotated with a managed identity's client ID; the pod is labelled `azure.workload.identity/use: "true"`, which triggers a mutating webhook to project a signed SA token into the pod and inject `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_FEDERATED_TOKEN_FILE`. The Azure SDK reads those, presents the projected token to Entra ID, which validates the signature against the cluster's OIDC issuer and matches a federated credential whose subject is `system:serviceaccount:<namespace>:<serviceaccount>`. Entra returns an Azure AD access token. Azure RBAC then authorises the actual resource call. It's IRSA with different names — and the pod label is the step everyone forgets.
+
+**18. Workload Identity is failing. How do you debug it?**
+Three distinct signatures. If `env | grep AZURE_` shows nothing, the pod label is missing so no token was projected. If you get `AADSTS70021: No matching federated identity record`, the federated credential subject or issuer doesn't match — compare them character for character. If a token is issued but the resource returns 403, authentication worked and the missing piece is an Azure RBAC role on the target. Knowing which of the three you're looking at takes the debug from an hour to a minute.
+
+**19. Why is `AZURE_CREDENTIALS` in GitHub Secrets an anti-pattern?**
+It's a long-lived client secret — valid for months, printable by anyone with repo write access or by any compromised third-party Action, unscoped so it works from any branch or a laptop, with no practical rotation story. Federated OIDC credentials replace it: GitHub mints a short-lived token bound to a specific `repo:org/repo:ref` or `:environment` subject, Entra exchanges it for an access token valid about an hour, and the only things in the repo are three non-secret IDs. Revocation is deleting one federated credential.
+
+**20. How do you scope a GitHub OIDC federated credential securely?**
+Bind the subject to a GitHub Environment (`repo:org/repo:environment:prod`) rather than a branch, and put a required reviewer on that environment — so the credential is unusable without a human approval. Never use a wildcard subject. Scope the Azure RBAC role assignment to the resource group, not the subscription, and use a purpose-specific role rather than `Contributor` where you can.
+
+### Terraform
+
+**21. How do you manage Terraform state on Azure, and how does it differ from AWS?**
+`azurerm` backend against a blob container, with `use_azuread_auth` so Terraform authenticates with Entra ID instead of a storage key — which lets you disable shared key access entirely. The key difference from AWS: locking is native via **blob leases**, so there's no DynamoDB lock table to create or forget. I also enable blob versioning on the container, which gives me a state history to restore from. And state contains secrets in plaintext, so that storage account has public network access disabled.
+
+**22. Workspaces or separate state files for multiple regions?**
+Separate state files. Workspaces share one backend key and one provider configuration, which makes it too easy to run a destroy in the wrong workspace, and region-as-a-variable branches through everything. Separate state gives a hard blast-radius boundary — a destroy in DR structurally cannot touch primary. I reserve workspaces for near-identical short-lived copies of the same config, like per-PR ephemeral environments.
+
+**23. How did you build cost control into your Terraform?**
+A `mode` variable with `count = var.mode == "production" ? 1 : 0` on the expensive modules — Application Gateway and Front Door. `terraform apply` gives me the cheap always-on subset; `terraform apply -var="mode=production"` adds the edge stack; going back to `mode=lab` destroys it. That's plain `count`, no exotic features. It turns "remember to delete the App Gateway" into a single deterministic command, and it means the same code describes both environments.
+
+**24. What ordering dependencies bit you?**
+Log Analytics must exist before AKS because the monitoring add-on takes a workspace resource ID at creation. Private DNS zones must be linked to the VNet before the private endpoints, or the `private_dns_zone_group` has nothing to write into. Federated credentials must come *after* AKS because the subject needs the cluster's OIDC issuer URL — which is why I create the managed identity early but federate it late. And Key Vault soft-delete reserves the vault name after destroy, so a rebuild with the same name fails until you purge it.
+
+### CI/CD
+
+**25. Describe your pipeline and where the gates are.**
+PR triggers fmt, validate, tfsec and Checkov, then a plan posted as a PR comment. On merge to main: build the image without pushing, Trivy-scan it with `exit-code 1` on HIGH/CRITICAL so a vulnerable image never reaches the registry, then push with an immutable git-SHA tag. Deploy is gated on a GitHub Environment with a required reviewer — which is also what the federated credential subject is bound to, so the credential itself is unusable without approval. Deploy sets the image by SHA, waits on `rollout status`, and runs `rollout undo` automatically on timeout.
+
+**26. Why immutable SHA tags rather than `latest`?**
+With `latest` plus `imagePullPolicy: Always`, two pods in the same Deployment can be running different code, because they pulled at different times. There's no way to know what's actually deployed, no reproducible rollback, and no audit trail. A SHA tag is a permanent, unambiguous pointer; rollback is redeploying the previous SHA. I also enable ACR's immutable tag setting so a tag can never be repointed after push.
+
+**27. Your GitHub-hosted runner can't reach a private AKS API server. Options?**
+Three. `az aks command invoke`, which runs the command through the AKS control plane rather than a direct API connection — free, no extra infrastructure, right answer for a lab. A self-hosted runner inside the VNet — more realistic for production, but you're now operating runners. Or GitHub Actions private networking. For most teams the self-hosted runner in the VNet is the production answer, since `command invoke` is awkward for complex deployments.
+
+### Observability
+
+**28. How do you keep Azure Monitor costs under control?**
+Platform metrics are free; logs are per-GB and that's where bills explode. Set a `dailyQuotaGb` cap on the Log Analytics workspace *before* enabling Container Insights. Use the cost-optimised Container Insights preset and exclude noisy namespaces like `kube-system` from stdout collection. Route high-volume, low-query-value data to Basic Logs tables. Keep default 31-day retention unless you have a compliance reason. And query `Usage | summarize sum(Quantity) by DataType` regularly to see which table is actually the problem.
+
+**29. What's the difference between a Log Analytics workspace and an Azure Monitor workspace?**
+They're two different resources with unhelpfully similar names. Log Analytics stores logs, queried with KQL, billed per GB ingested. An Azure Monitor workspace stores Prometheus metrics for managed Prometheus, billed per sample. Managed Grafana connects to both. Confusing them is a common source of "why can't I query my metrics with KQL".
+
+**30. Where does OpenTelemetry fit?**
+It's the ingestion path for Application Insights. In Python it's a single `configure_azure_monitor()` call that wires traces, metrics, and logs over OTLP — no collector to run. The meaningful difference from a Loki/Tempo/Prometheus stack is that Azure's backend is unified: traces, logs, and metrics land in the same workspace and correlate automatically by `operation_Id`, so the Application Map builds itself. You give up backend portability in exchange for not operating the pipeline.
+
+### HA, DR and Multi-region
+
+**31. Which resources did you duplicate across regions and which are global?**
+Global and shared: Front Door profile and WAF policy, the Entra ID tenant with its managed identities and federated credentials, the public DNS zone, ACR (Premium geo-replication is one registry with replicas, so the login server is identical in both regions — my manifests don't change), and one Log Analytics workspace so I keep a single pane of glass. Duplicated per region: VNet with non-overlapping CIDRs, AKS, Application Gateway, SQL, Redis, Key Vault. Terraform state lives in the primary region in a separate resource group, on the reasoning that losing state is worse than the cross-region dependency.
+
+**32. What's your RTO and RPO, and why?**
+Traffic RTO was driven by Front Door's health probe configuration — probe interval times required samples, so roughly 30–90 seconds of 5xx before the edge promoted the secondary. RPO depended entirely on the SQL strategy: the free-tier offer doesn't support failover groups, so I used geo-restore from geo-redundant backup, giving an RPO of up to an hour. In production I'd use a failover group to get RPO to seconds and RTO to a managed listener switch. That gap is a deliberate cost decision, and I can quantify it. Redis I deliberately did not replicate — a cache isn't a source of truth, and a cold cache after failover is expected behaviour, not an incident.
+
+**33. What actually breaks during regional failover that a diagram doesn't show?**
+In-flight requests fail — Front Door can't retroactively reroute a connection that's already established. Sessions held in the region-1 Redis are gone, so anything not backed by the database is lost. The secondary's cache is cold, so latency spikes and the database sees a thundering herd of misses right when it's least ready. If the secondary was scaled down to save money, the Cluster Autoscaler needs minutes to add capacity — so the first minutes after failover are the worst-performing ones. And failing *back* is the harder direction, because you have to re-establish replication in the correct direction without losing writes that happened in the secondary.
+
+**34. How would you cost-optimise this platform in production?**
+The big levers in order: Reserved Instances or Savings Plans on steady-state node capacity (up to ~70%); Spot node pools for interruptible workloads, gated with taints and PDBs; right-sizing from actual usage rather than requests; the AKS Free tier for all non-production clusters; log ingestion caps and Basic Logs tables; SQL serverless with auto-pause for dev databases; and picking the right WAF product — App Gateway WAF's hourly floor versus Front Door's bundled tier can be a several-hundred-dollar-a-month difference at low traffic. The Azure-specific trap is meters that bill on *existence* rather than usage: App Gateway, NAT Gateway, unattached public IPs, and orphaned managed disks.
+
+---
+
+## 26. Portfolio README Template
+
+### 26.1 The README
+
+```markdown
+# AzureShop — Production-Style Multi-Region Platform on Azure
+
+A production-patterned, highly available application platform on Microsoft Azure,
+built entirely with Terraform and deployed through GitHub Actions with OIDC
+federation. Zero static cloud credentials anywhere in the system.
+
+Built in a 5-day sprint on a constrained budget, with every expensive component
+deliberately create/verify/destroy rather than always-on — a real engineering
+constraint, handled explicitly.
+
+## Architecture
+
+[architecture diagram]
+
+Traffic path: Internet → Azure Front Door (WAF) → Application Gateway (WAF v2)
+→ AKS ingress → frontend / API / worker → Azure SQL + Redis + Blob, all reached
+over Private Endpoints.
+
+**Public surface: exactly one endpoint.** No node has a public IP. No data service
+is reachable from the internet.
+
+## Technologies
+
+| Layer | Technology |
+|---|---|
+| Compute | AKS (Azure CNI Overlay + Cilium), system/user node pools, Cluster Autoscaler, HPA |
+| Edge | Azure Front Door, Application Gateway WAF v2, Azure WAF managed rules |
+| Network | VNet, regional subnets, NSGs with service tags, NAT Gateway, Private Endpoints, Private DNS |
+| Identity | Microsoft Entra ID, Azure RBAC, user-assigned Managed Identity, AKS Workload Identity, GitHub OIDC federation |
+| Data | Azure SQL (serverless), Azure Cache for Redis, Blob Storage |
+| Secrets | Azure Key Vault + Secrets Store CSI Driver |
+| IaC | Terraform (azurerm v4), remote state with blob-lease locking |
+| CI/CD | GitHub Actions, OIDC, Trivy, tfsec, Checkov |
+| Observability | Azure Monitor, Log Analytics (KQL), Managed Prometheus, Managed Grafana, OpenTelemetry → Application Insights |
+| Governance | Azure Policy, Defender for Cloud (CSPM), budget alerts |
+
+## Repository structure
+[tree]
+
+## Deployment
+
+    # 1. Bootstrap remote state (once)
+    cd bootstrap && terraform init && terraform apply
+
+    # 2. Cheap lab mode
+    cd envs/lab && terraform init && terraform apply
+
+    # 3. Full production simulation (adds App Gateway + Front Door)
+    terraform apply -var="mode=production"
+
+    # 4. Workloads
+    az aks get-credentials -g rg-azshop-lab-sea -n aks-azshop-lab-sea
+    kubectl apply -k k8s/overlays/lab
+
+## Security posture
+- Zero static credentials: GitHub OIDC federation for CI, Workload Identity for pods
+- All PaaS data services behind Private Endpoints with public network access disabled
+- Default-deny NetworkPolicy enforced by the Cilium dataplane
+- Containers run non-root with a read-only root filesystem and all capabilities dropped
+- Trivy blocks HIGH/CRITICAL vulnerabilities in CI before push
+- Azure Policy assigned; Defender for Cloud CSPM enabled
+
+## High availability and disaster recovery
+- Two regions: southeastasia (primary) / eastasia (secondary)
+- Front Door priority-based origin groups with health-probe failover
+- Measured during an induced regional outage:
+
+| Metric | Measured | Production target |
+|---|---|---|
+| Failure detection | __ s | < 30 s |
+| Traffic RTO | __ s | < 60 s |
+| Data RPO | __ | < 5 min (failover group) |
+| Failback RTO | __ s | < 60 s |
+| Requests lost | __ / __ | — |
+
+## Failure tests performed
+| # | Test | Result |
+|---|---|---|
+| 1 | Pod deletion | Auto-recovered in __s |
+| 2 | Node deallocation | Rescheduled in __s, VMSS replaced node |
+| 3 | Availability zone drain | Pods redistributed, no downtime |
+| 4 | CrashLoopBackOff | Diagnosed via `logs --previous` |
+| 5 | HPA + Cluster Autoscaler | Scaled 2→6 pods, 1→2 nodes in __s |
+| 6 | Ingress endpoint break | Diagnosed via empty Service endpoints |
+| 7 | CoreDNS outage | Full-cluster resolution failure, recovered |
+| 8 | Workload Identity break (3 modes) | Distinguished label / federation / RBAC failures |
+| 9 | ACR auth removal | Running pods unaffected; new pulls failed |
+| 10 | Private endpoint deletion | Timeouts, diagnosed via in-pod nslookup |
+| 11 | **Full regional failover** | Front Door promoted secondary in __s |
+
+## Cost engineering
+Built under a hard credit constraint. Total spend: **$__**.
+
+- Two-mode Terraform (`mode=lab` / `mode=production`) so expensive edge components exist only when in use
+- Application Gateway WAF v2 (~$10.60/day) stood up for a single 3-hour session
+- Azure SQL free offer (serverless, 100k vCore-seconds/month) instead of a provisioned tier
+- AKS Free-tier control plane; burstable B-series nodes
+- Log Analytics daily ingestion cap
+- Full teardown and rebuild-from-Git verified — platform rebuild time: **__ minutes**
+
+## Lessons learned
+1. Private Endpoints without linked Private DNS zones fail *silently* — traffic leaves the VNet with no error.
+2. Azure's three-layer identity model (Entra ID / Azure RBAC / data-plane RBAC) has no AWS equivalent; `Owner` does not grant secret reads.
+3. Workload Identity has three distinct failure signatures and telling them apart is the whole debugging skill.
+4. Some Azure meters bill on *existence*, not usage — App Gateway, NAT Gateway, unattached public IPs.
+5. Key Vault soft-delete reserves the vault name after destroy, which breaks naive rebuild loops.
+6. Azure subnets are regional, not zonal, which simplifies CIDR planning but changes how you reason about zone resilience.
+```
+
+### 26.2 Evidence to capture — do this on Day 5 before teardown
+
+**This is what proves you actually built it. Without it, the README is a claim.**
+
+| # | Evidence | How |
+|---|---|---|
+| 1 | Azure Portal resource group view showing all resources with tags | Screenshot |
+| 2 | `terraform apply` completion output with resource counts | Screenshot or paste |
+| 3 | `kubectl get nodes -o wide -L topology.kubernetes.io/zone` | Terminal screenshot |
+| 4 | `kubectl get pods -A -o wide` showing all workloads Running | Terminal screenshot |
+| 5 | **In-pod `nslookup` returning `10.20.5.x` for SQL** — proves private endpoints | Terminal screenshot |
+| 6 | `/secret` endpoint returning a Key Vault value — proves Workload Identity | Terminal screenshot |
+| 7 | GitHub Actions run summary showing OIDC login with no secrets | Screenshot |
+| 8 | Trivy scan **failing** a build on a CRITICAL CVE | Screenshot |
+| 9 | Grafana dashboard with live cluster metrics | Screenshot |
+| 10 | Application Insights Application Map with traces | Screenshot |
+| 11 | KQL query results (pod restarts or 5xx rate) | Screenshot |
+| 12 | **WAF blocking a SQLi probe** — the `curl` 403 and the matching log entry | Screenshot ×2 |
+| 13 | Front Door origin group showing both regions and health status | Screenshot |
+| 14 | **`dr-timeline.log`** — the raw failover timing evidence | Commit the file |
+| 15 | HPA scaling event (`kubectl get hpa` before/during/after) | Screenshot |
+| 16 | Cluster Autoscaler log showing a scale-up decision | Paste |
+| 17 | Cost Management showing actual total spend | Screenshot |
+| 18 | Architecture diagram (the Mermaid ones from this document) | Commit as `docs/architecture.md` |
+| 19 | Post-teardown `az group list` showing an empty subscription | Screenshot |
+| 20 | Rebuild timing — destroy, clone fresh, apply, timestamped | Terminal recording (`asciinema`) |
+
+> **Record a 3–5 minute screen capture** narrating the architecture and one failure test. It takes 20 minutes and it's more persuasive than the entire README.
+
+---
+
+## 27. Definition of Done
+
+Do not consider this project complete until every box is ticked.
+
+### Infrastructure
+- [ ] Entire platform builds from `terraform apply` with no manual portal steps
+- [ ] `terraform destroy` then `terraform apply` reproduces the platform — **completed at least twice**
+- [ ] Rebuild-from-clean-Git-clone verified and **timed**
+- [ ] Remote state in Azure Blob with blob-lease locking and versioning
+- [ ] Two-mode deployment works: `mode=lab` and `mode=production`
+- [ ] DR region deploys from the same modules with only variable changes
+
+### Networking
+- [ ] VNet with regional subnets and NSGs on every subnet
+- [ ] `GatewayManager` rule present on the App Gateway NSG
+- [ ] Explicit egress via NAT Gateway; no default outbound reliance
+- [ ] Private Endpoints for SQL, Redis, Storage, Key Vault, ACR
+- [ ] **In-pod `nslookup` returns private IPs for all five** — verified and screenshotted
+- [ ] Public network access disabled on all data services
+
+### Kubernetes
+- [ ] AKS with Azure CNI Overlay + Cilium
+- [ ] System pool tainted; user pool carries workloads
+- [ ] All three workloads deployed (frontend, API, worker)
+- [ ] Ingress working; **Gateway API version also demonstrated**
+- [ ] HPA, PDB, topology spread, anti-affinity, all three probe types configured
+- [ ] Default-deny NetworkPolicy enforced
+
+### Identity
+- [ ] GitHub Actions deploys with **zero secrets stored** — only three non-secret IDs
+- [ ] Pod reads a Key Vault secret via Workload Identity with nothing mounted
+- [ ] `az ad sp list` shows no password credentials you own
+- [ ] RBAC scoped to resource groups, not the subscription
+- [ ] All three Workload Identity failure modes reproduced and diagnosed
+
+### CI/CD
+- [ ] PR runs fmt, validate, tfsec, Checkov, and posts a plan comment
+- [ ] Merge to main builds, Trivy-scans, and pushes with an immutable SHA tag
+- [ ] Trivy **actually blocked** a build (prove it with a deliberately vulnerable base image)
+- [ ] Deploy gated by a GitHub Environment with a required reviewer
+- [ ] Automatic rollback on failed rollout demonstrated
+
+### Observability
+- [ ] Container Insights with a daily ingestion cap
+- [ ] Managed Prometheus + Managed Grafana with live dashboards
+- [ ] OpenTelemetry traces visible in Application Insights
+- [ ] At least 5 alert rules with an action group
+- [ ] KQL queries written for pod restarts and 5xx rate
+
+### Resilience
+- [ ] Survived pod deletion with no request loss
+- [ ] Survived node deallocation
+- [ ] HPA and Cluster Autoscaler both triggered by real load
+- [ ] Zone drain redistributed pods
+- [ ] All 10 failure experiments run, with observations recorded
+
+### Disaster recovery
+- [ ] Second region deployed from the same modules
+- [ ] Front Door origin group with both regions
+- [ ] **Regional failover induced and traffic RTO measured** — number recorded
+- [ ] RPO understood and documented, including the free-tier limitation
+- [ ] Failback completed
+
+### Cost
+- [ ] Budget alerts configured before spending began
+- [ ] Daily audit script run every session
+- [ ] Total spend known and recorded
+- [ ] **Full teardown verified: `az group list` shows an empty subscription**
+- [ ] No orphaned public IPs, disks, or `MC_*` resource groups
+- [ ] Key Vaults purged
+
+### Explanation — the actual point
+- [ ] Can whiteboard the architecture from memory in under 5 minutes
+- [ ] Can explain every AWS→Azure difference in §3 without notes
+- [ ] Can explain why each Terraform module boundary sits where it does
+- [ ] Can explain the security model across all three identity layers
+- [ ] Can quote real RTO/RPO numbers and defend them
+- [ ] Can explain the cost of every component and what you'd change in production
+- [ ] Can answer all 34 questions in §25 out loud
+
+---
+
+## Appendix A — Command Reference
+
+### Azure CLI
+```bash
+# Account
+az login [--use-device-code] ; az account list -o table ; az account set -s <id>
+az account show --query "{sub:name,tenant:tenantId,user:user.name}" -o json
+az vm list-usage -l southeastasia -o table            # quota - check FIRST
+
+# Resource groups
+az group create -n <rg> -l southeastasia --tags K=V
+az group list -o table ; az resource list -g <rg> -o table
+az group delete -n <rg> --yes --no-wait
+
+# AKS
+az aks create -g <rg> -n <aks> --tier free --network-plugin azure \
+  --network-plugin-mode overlay --network-dataplane cilium \
+  --enable-oidc-issuer --enable-workload-identity --attach-acr <acr>
+az aks get-credentials -g <rg> -n <aks> --overwrite-existing
+az aks show -g <rg> -n <aks> --query oidcIssuerProfile.issuerUrl -o tsv
+az aks nodepool list -g <rg> --cluster-name <aks> -o table
+az aks nodepool scale -g <rg> --cluster-name <aks> -n user --node-count 3
+az aks command invoke -g <rg> -n <aks> --command "kubectl get pods -A"   # private clusters
+az aks check-acr -g <rg> -n <aks> --acr <acr>.azurecr.io
+az aks get-upgrades -g <rg> -n <aks> -o table
+
+# ACR
+az acr login -n <acr> ; az acr repository list -n <acr> -o table
+az acr repository show-tags -n <acr> --repository azureshop-api -o table
+az acr build -r <acr> -t azureshop-api:v1 ./app        # builds IN Azure, no local Docker
+
+# Key Vault
+az keyvault secret set --vault-name <kv> -n demo-secret --value "hello"
+az keyvault secret show --vault-name <kv> -n demo-secret --query value -o tsv
+az keyvault list-deleted -o table ; az keyvault purge -n <kv> -l southeastasia
+
+# Identity
+az identity create -g <rg> -n id-azureshop-workload
+az identity federated-credential create --name fc-api --identity-name id-azureshop-workload \
+  -g <rg> --issuer "<oidc-url>" --subject "system:serviceaccount:azureshop:azureshop-sa" \
+  --audience api://AzureADTokenExchange
+az role assignment list --assignee <id> --all -o table
+
+# Network
+az network vnet subnet list -g <rg> --vnet-name <vnet> -o table
+az network nsg rule list -g <rg> --nsg-name <nsg> -o table
+az network private-endpoint list -g <rg> -o table
+az network private-dns zone list -g <rg> -o table
+az network private-dns record-set a list -g <rg> -z privatelink.database.windows.net -o table
+
+# Monitoring
+az monitor log-analytics query --workspace <guid> --analytics-query "<KQL>" -o table
+az monitor log-analytics workspace update -g <rg> -n <law> --set workspaceCapping.dailyQuotaGb=1
+
+# Cost
+az consumption usage list --start-date 2026-09-01 --end-date 2026-09-06 -o table
+az consumption budget list -o table
+```
+
+### Terraform
+```bash
+terraform init [-upgrade] [-reconfigure] [-migrate-state]
+terraform fmt -recursive ; terraform validate
+terraform plan -var="mode=lab" -out=tfplan
+terraform apply tfplan
+terraform apply -var="mode=production"          # ⚠️ EXPENSIVE
+terraform destroy -auto-approve
+terraform state list ; terraform state show <addr>
+terraform import <addr> <azure-resource-id>
+terraform force-unlock <LOCK_ID>
+terraform output -json | jq
+terraform console                                # test expressions interactively
+```
+
+### kubectl
+```bash
+kubectl get pods -A -o wide
+kubectl get nodes -o wide -L topology.kubernetes.io/zone -L agentpool
+kubectl describe pod <pod> | grep -A10 Events
+kubectl logs <pod> --previous -f                 # --previous for crashed containers
+kubectl get events -A --sort-by=.lastTimestamp | tail -30
+kubectl get endpoints -n <ns>                    # <none> = broken selector or readiness
+kubectl top nodes ; kubectl top pods -n <ns>
+kubectl rollout status deploy/<d> -n <ns> --timeout=180s
+kubectl rollout undo deploy/<d> -n <ns>
+kubectl rollout restart deploy/<d> -n <ns>
+kubectl set image deploy/<d> api=<acr>.azurecr.io/app:<sha> -n <ns>
+kubectl cordon <node> ; kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
+kubectl auth can-i --list --as=system:serviceaccount:azureshop:azureshop-sa
+kubectl run netshoot --rm -it --image=nicolaka/netshoot --restart=Never -- bash
+kubectl port-forward -n azureshop svc/azureshop-api 8000:8000
+```
+
+### Helm, Docker, Git
+```bash
+helm repo add <n> <url> && helm repo update
+helm upgrade --install <rel> <chart> -n <ns> --create-namespace -f values.yaml
+helm template <rel> <chart> -f values.yaml       # render without installing - debug first
+helm history <rel> -n <ns> ; helm rollback <rel> <rev> -n <ns>
+
+docker buildx build --platform linux/amd64 -t <acr>.azurecr.io/app:<sha> ./app
+docker push <acr>.azurecr.io/app:<sha>
+docker run --rm aquasec/trivy image <acr>.azurecr.io/app:<sha> --severity HIGH,CRITICAL
+
+git checkout -b feat/networking ; git add -A ; git commit -m "feat: vnet module"
+git push -u origin feat/networking
+git tag -a v1.0.0 -m "AzureShop platform v1" && git push --tags
+```
+
+---
+
+## Appendix B — Quick Start Checklist
+
+Print this. Tick as you go.
+
+```
+DAY 0  ── PRE-FLIGHT ──────────────────────────────────────────
+[ ] Azure account created
+[ ] az / terraform / kubectl / helm / docker installed
+[ ] az login works, subscription set
+[ ] ⚠️ vCPU QUOTA CHECKED  (az vm list-usage -l southeastasia)
+[ ] Resource providers registered
+[ ] GitHub repo created
+[ ] aks-store-demo cloned
+
+DAY 1  ── FOUNDATION ──────────────  target ~$1.50  ───────────
+[ ] .envrc created and sourced
+[ ] Resource group + tags
+[ ] ⚠️ BUDGET ALERTS SET   ($50 / $99 / $135)
+[ ] Bootstrap state storage account
+[ ] modules/network applied
+[ ] 5 private DNS zones created AND linked
+[ ] destroy + apply loop practised
+
+DAY 2  ── IDENTITY + AKS + DATA ───  target ~$6  ──────────────
+[ ] Redis started FIRST (15-25 min provisioning)
+[ ] User-assigned MI + role assignments
+[ ] Key Vault + PE + demo-secret
+[ ] ACR + PE + --attach-acr
+[ ] AKS (Overlay + Cilium + Free tier)
+[ ] SQL free offer + Storage + all 5 PEs
+[ ] ⭐ In-pod nslookup returns 10.20.5.x for ALL FIVE
+[ ] Workload Identity: /secret returns a Key Vault value
+[ ] aks-store-demo running and reachable
+
+DAY 3  ── CI/CD + OBSERVABILITY ───  target ~$8  ──────────────
+[ ] App registration + 2 federated credentials
+[ ] infra.yml + app.yml green
+[ ] Log Analytics with 1 GB DAILY CAP
+[ ] Managed Grafana created (FREE 30-DAY WINDOW STARTS NOW)
+[ ] Managed Prometheus wired to AKS
+[ ] OTel traces in Application Insights
+[ ] 5 alert rules + action group
+[ ] Gateway API demo  [STRETCH]
+[ ] Rebuild-from-Git test, TIMED
+
+DAY 4  ── EDGE + CHAOS ────────────  target ~$25  ─────────────
+[ ] ⏰ PHONE ALARM SET FOR +3 HOURS
+[ ] terraform apply -var="mode=production"
+[ ] App Gateway healthy (GatewayManager rule!)
+[ ] Front Door Standard + origin locked to service tag
+[ ] SQLi probe blocked, WAF log captured
+[ ] Experiments 1,2,4,5,6,7,8,9,10 run
+[ ] ⚠️ terraform apply -var="mode=lab"  ← DESTROYS APP GATEWAY
+[ ] az network application-gateway list returns []
+
+DAY 5  ── DR + TEARDOWN ───────────  target ~$25  ─────────────
+[ ] ⏰ PHONE ALARM SET
+[ ] envs/dr applied
+[ ] Region 2 workloads deployed (identical manifests)
+[ ] Priority-2 origin added to Front Door
+[ ] Continuous probe running -> dr-timeline.log
+[ ] ⭐ REGIONAL FAILOVER INDUCED, RTO MEASURED
+[ ] Failback completed
+[ ] All 20 evidence items captured
+[ ] scripts/nuke.sh run
+[ ] az group list -> EMPTY
+[ ] Key Vaults purged
+[ ] Final cost recorded in README
+```
+
+---
+
+## Appendix C — References
+
+Verify anything cost- or capability-related against these before you rely on it.
+
+**Pricing**
+- Azure Pricing Calculator — https://azure.microsoft.com/pricing/calculator/
+- Application Gateway pricing explained — https://learn.microsoft.com/azure/application-gateway/understanding-pricing
+- Front Door billing — https://learn.microsoft.com/azure/frontdoor/billing
+- Front Door pricing — https://azure.microsoft.com/pricing/details/frontdoor/
+- Azure Cache for Redis pricing — https://azure.microsoft.com/pricing/details/cache/
+- Azure Managed Grafana pricing — https://azure.microsoft.com/pricing/details/managed-grafana/
+- AKS pricing — https://azure.microsoft.com/pricing/details/kubernetes-service/
+
+**Free offers**
+- Azure SQL Database free offer — https://learn.microsoft.com/azure/azure-sql/database/free-offer
+- Azure free account — https://azure.microsoft.com/free/
+
+**AKS**
+- Ingress concepts and the NGINX retirement notice — https://learn.microsoft.com/azure/aks/concepts-network-ingress
+- App routing with Gateway API — https://learn.microsoft.com/azure/aks/app-routing-gateway-api
+- Azure CNI Overlay — https://learn.microsoft.com/azure/aks/azure-cni-overlay
+- Workload Identity — https://learn.microsoft.com/azure/aks/workload-identity-overview
+- Cluster Autoscaler — https://learn.microsoft.com/azure/aks/cluster-autoscaler
+
+**Networking & security**
+- Private Endpoint DNS configuration — https://learn.microsoft.com/azure/private-link/private-endpoint-dns
+- Service tags — https://learn.microsoft.com/azure/virtual-network/service-tags-overview
+- Application Gateway for Containers — https://learn.microsoft.com/azure/application-gateway/for-containers/overview
+
+**Sample application**
+- AKS Store Demo — https://github.com/Azure-Samples/aks-store-demo
+- AKS tutorial using it — https://learn.microsoft.com/azure/aks/tutorial-kubernetes-prepare-app
+
+**Terraform**
+- azurerm provider — https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs
+- azurerm backend — https://developer.hashicorp.com/terraform/language/backend/azurerm
+
+---
+
+*Document version 1.0 · Verified against public Azure documentation and pricing, September 2026. Azure changes fast — re-verify anything cost- or capability-critical before you rely on it.*

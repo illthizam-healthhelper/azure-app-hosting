@@ -1,0 +1,53 @@
+# Local .terraform directories
+**/.terraform/*
+
+# Terraform lock file (optional: commit it to pin provider versions)
+# .terraform.lock.hcl
+
+# State files - contain sensitive data
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Variable files - often contain secrets
+*.tfvars
+*.tfvars.json
+
+# Override files - usually local customizations
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Terraform plan output files
+*.tfplan
+*.tfplan.json
+tfplan
+
+# CLI configuration files
+.terraformrc
+terraform.rc
+
+# Sensitive/credential files
+*.pem
+*.key
+*.pfx
+*.p12
+.env
+.env.*
+
+# Azure CLI / auth artifacts
+.azure/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
