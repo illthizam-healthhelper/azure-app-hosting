@@ -8,23 +8,6 @@ variable "management_group_display_name" {
   type        = string
 }
 
-variable "subscription_name" {
-  description = "Name of the Azure subscription"
-  type        = string
-}
-
-variable "billing_scope_id" {
-  description = "Azure billing scope used to create the subscription"
-  type        = string
-  sensitive   = true
-}
-
-variable "workload" {
-  description = "Subscription workload type"
-  type        = string
-  default     = "Production"
-}
-
 variable "resource_group_name" {
   description = "Name of the application Resource Group"
   type        = string

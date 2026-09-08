@@ -10,13 +10,10 @@ resource "azurerm_resource_group" "this" {
   tags = var.tags
 }
 
-resource "azurerm_subscription" "this" {
-  subscription_name = var.subscription_name
-  billing_scope_id  = var.billing_scope_id
+# Free Trial accounts cannot create subscriptions; use the current one
+data "azurerm_subscription" "current" {}
 
-  workload = var.workload
-}
 resource "azurerm_management_group_subscription_association" "this" {
   management_group_id = azurerm_management_group.this.id
-  subscription_id     = azurerm_subscription.this.id
+  subscription_id     = data.azurerm_subscription.current.id
 }
