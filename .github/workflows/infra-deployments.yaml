@@ -1,0 +1,152 @@
+name: infra-deployments
+
+on:
+  pull_request:
+    paths: ['envs/**', 'modules/**']
+  push:
+    branches: [main]
+    paths: ['envs/**', 'modules/**']
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'lab (cheap) or production (EXPENSIVE - App Gateway ~$10.60/day)'
+        required: true
+        default: 'lab'
+        type: choice
+        options: [lab, production]
+
+permissions:
+  id-token: write        # REQUIRED for OIDC - without this the token request fails
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: '1.9.8'
+  WORKING_DIR: envs/lab
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+      - name: terraform init (no backend)
+        run: terraform init -backend=false
+        working-directory: ${{ env.WORKING_DIR }}
+      - name: terraform validate
+        run: terraform validate
+        working-directory: ${{ env.WORKING_DIR }}
+
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          soft_fail: true          # start soft; tighten once you've triaged findings
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform
+          soft_fail: true
+
+  plan:
+    needs: [validate, security-scan]
+    runs-on: ubuntu-latest
+    environment: lab
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Azure login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        run: terraform init
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_USE_OIDC:         'true'
+          ARM_CLIENT_ID:        ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID:        ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID:  ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: terraform plan
+        id: plan
+        run: |
+          terraform plan \
+            -var="mode=${{ inputs.mode || 'lab' }}" \
+            -out=tfplan -no-color | tee plan.txt
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_USE_OIDC:        'true'
+          ARM_CLIENT_ID:       ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID:       ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ env.WORKING_DIR }}/plan.txt', 'utf8');
+            const body = '### Terraform Plan\n```\n' + plan.slice(0, 60000) + '\n```';
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.WORKING_DIR }}/tfplan
+          retention-days: 1
+
+  apply:
+    needs: plan
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: prod        # <- GitHub Environment with a REQUIRED REVIEWER = the approval gate
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id:       ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: ${{ env.WORKING_DIR }}
+      - run: terraform init
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_USE_OIDC: 'true'
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - run: terraform apply -auto-approve tfplan
+        working-directory: ${{ env.WORKING_DIR }}
+        env:
+          ARM_USE_OIDC: 'true'
+          ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+          ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
