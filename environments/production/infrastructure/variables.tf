@@ -61,3 +61,65 @@ variable "route_table_by_subnet" {
   type        = map(string)
   default     = {}
 }
+
+variable "private_dns_zone_names" {
+  type = list(string)
+  default = [
+    "privatelink.database.windows.net",
+    "privatelink.redis.cache.windows.net",
+    "privatelink.blob.core.windows.net",
+    "privatelink.vaultcore.azure.net",
+    "privatelink.azurecr.io",
+  ]
+}
+
+variable "acr_name" {
+  type = string
+}
+
+variable "key_vault_name" {
+  type = string
+}
+
+variable "aks_cluster_name" {
+  type = string
+}
+
+variable "aks_dns_prefix" {
+  type = string
+}
+
+variable "aks_authorized_ip_ranges" {
+  type    = list(string)
+  default = []
+}
+
+variable "workload_identity_name" {
+  type = string
+}
+
+variable "k8s_namespace" {
+  type    = string
+  default = "default"
+}
+
+variable "k8s_service_account_name" {
+  type    = string
+  default = "azureshop-api"
+}
+
+variable "sql_server_name" {
+  type = string
+}
+
+variable "sql_database_name" {
+  type = string
+}
+
+variable "redis_name" {
+  type = string
+}
+
+variable "storage_account_name" {
+  type = string
+}
