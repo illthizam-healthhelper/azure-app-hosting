@@ -1,4 +1,4 @@
-name: infra-deployments
+name: infra-deployments to production
 
 on:
   pull_request:
